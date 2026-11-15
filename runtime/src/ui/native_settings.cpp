@@ -2,7 +2,11 @@
 // The settings menu and HOME Menu on every platform: their state, keys and what they show. The window's own side is the
 // interface in host_window.h (host_window_win32.cpp, the SDL host).
 
+#include "galaxy/benchmark.h"
+#include "galaxy/desktop_window.h"
+#include "galaxy/discord_presence.h"
 #include "galaxy/render/host_window.h"
+#include "galaxy/ui/benchmark_menu.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/virtual_keys.h"
 #include "galaxy/path_text.h"
@@ -14,7 +18,11 @@
 #include "galaxy/render/galaxy_select.h"
 #include "galaxy/render/post_process_settings.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 #include "galaxy/render/renderer_common.h"
+#if defined(_WIN32)
+#include "galaxy/render/renderer_check.h"
+#endif
 #include "galaxy/render/texture_pack.h"
 #include "galaxy/render_api.h"
 #include "galaxy/mii_import.h"
@@ -38,6 +46,10 @@
 #include "galaxy/ui/settings_display_page.h"
 #include "galaxy/ui/settings_advanced_page.h"
 #include "galaxy/ui/settings_system_page.h"
+#include "galaxy/save_transfer.h"
+#if defined(NEBULA_UPDATE_CHECK)
+#include "galaxy/update.h"
+#endif
 
 #include <luma_services.h>
 
@@ -235,11 +247,8 @@ bool restart_asking() {
 constexpr const char* kNativeSettingsTabNames[] = {"DISPLAY", "GRAPHICS", "CONTROLS", "AUDIO", "GENERAL", "MODS", "SYSTEM",
                                                    "ADVANCED"};
 // The pages that can be shown, in order.
-#if defined(__ANDROID__)
-constexpr unsigned kPages[] = {0u, 1u, 2u, 3u, 4u, 5u, 7u};  // nothing on SYSTEM there: diagnostics are the launcher's
-#else
 constexpr unsigned kPages[] = {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u};
-#endif
+constexpr unsigned kSystemTab = 6u;
 constexpr unsigned kAdvancedTab = 7u;
 
 // ADVANCED (any galaxy and star, the Grand Stars) is a testing tool: in test builds (CMake NEBULA_TEST_TOOLS) and in
@@ -294,7 +303,7 @@ bool row_hidden(const char* label) {
         "POST-PROCESS", "RAY TRACING HARDWARE", "NVIDIA STREAMLINE", "NVIDIA REFLEX", "DLSS", "DLSS FRAME GENERATION",
 #if defined(__ANDROID__)
         // MONITOR, DISPLAY MODE and RESOLUTION: the display page has none on a phone (fullscreen_only).
-        "REFRESH RATE", "VSYNC", "DISCORD STATUS", "GRAPHICS CARD", "DIAGNOSTICS",
+        "REFRESH RATE", "VSYNC", "DISCORD STATUS",
 #endif
     };
     for (const char* hidden : kHidden) {
@@ -368,6 +377,7 @@ constexpr std::uint64_t kDisplayConfirmMs = 15000u;
 constexpr unsigned kControlsTab = 2u;
 constexpr unsigned kAudioTab = 3u;
 constexpr unsigned kAudioResetRow = 8u;  // after the seven volumes and the sound output
+constexpr unsigned kGeneralTab = 4u;
 constexpr unsigned kModsTab = 5u;
 galaxy::input::ControlsConfig s_controls_draft = galaxy::input::default_controls_config();
 RuntimeInputMode s_input_mode_draft = RuntimeInputMode::Auto;
@@ -685,7 +695,7 @@ unsigned pending_settings_changes() {
 
 enum class ControlsRow {
     InputMode,
-    CoStar,  // runtime_settings co_star: the last of two or more controllers is a second player (Windows' host only)
+    CoStar,  // runtime_settings co_star: the last of two or more controllers is a second player (input/co_star.h)
     Device,
     Binding,
     PointerSpeed,
@@ -806,11 +816,8 @@ std::vector<ControlsRowInfo> controls_rows() {
         joycons.lefts + joycons.rights != 0u) {
         rows.push_back({ControlsRow::PairJoyCon});
     }
-#if defined(_WIN32)
-    // Co-Star: one setting for every controller, so it sits with the input mode. Only the Windows host runs a second
-    // player (host_input.cpp update_co_star; the other hosts' native_game_co_star have none yet).
+    // Co-Star: one setting for every controller, so it sits with the input mode (every host: input/co_star.h).
     rows.push_back({ControlsRow::CoStar});
-#endif
     if (galaxy::is_wii_remote_mode(s_input_mode_draft)) {
         rows.push_back({ControlsRow::WiimoteStatus});
         return rows;
@@ -1541,8 +1548,14 @@ void set_native_settings_visible(bool visible) {
         reset_controls_draft();
         refresh_controls_devices(true);
         settle_native_settings_row();
+        ui::benchmark_menu::refresh();
+#if defined(_WIN32) && defined(_M_X64)
+        // The renderer check, the first time the menu opens, so the System page's RENDERER row has its answers.
+        (void)renderer_check();
+#endif
     }
     if (!visible) {
+        ui::benchmark_menu::close();
         // A mod's request screen left unanswered is the player's no (services/mods.md 9, services/save.md 8).
         deny_asks();
         end_text_edit(false);
@@ -1810,6 +1823,14 @@ void request_native_settings_close() {
 }
 
 bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad = false) {
+    // A benchmark runs: its panel has the keys. Escape (a controller's B or Menu, Android's back) stops it; no menu
+    // opens over it, and the game, which plays nothing then, gets no key.
+    if (galaxy::bench::running()) {
+        if (!was_down && key == VK_ESCAPE) galaxy::bench::stop();
+        if (!from_pad) galaxy::host::note_keyboard_input();
+        s_last_key_from_pad.store(from_pad, std::memory_order_relaxed);
+        return true;
+    }
     if (s_home_menu.visible.load(std::memory_order_acquire)) {
         return handle_home_menu_key(key, was_down);
     }
@@ -1892,7 +1913,8 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
         return true;
     }
     if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
-        (mod_question_key(key, was_down) || dlss_prompt_key(key, was_down) || restart_ask_key(key, was_down))) {
+        (mod_question_key(key, was_down) || dlss_prompt_key(key, was_down) || restart_ask_key(key, was_down) ||
+         ui::benchmark_menu::key(key, was_down, show_controls_message))) {
         return true;
     }
     if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
@@ -2121,6 +2143,302 @@ void open_folder_in_explorer(const std::filesystem::path& folder) {
 
 // Explorer at the Mii import folder (its files join the database at every start).
 void open_mii_folder() { open_folder_in_explorer(galaxy::host::mii_import_folder()); }
+
+// SAVES (GENERAL page): an import is picked, read and checked (save_transfer::plan_import). A save of this release is
+// read by the game (save_transfer::game_reader, nebula_save_import.h) and the player places its files one by one; at
+// the write the game reads it again with the save as it is then, and the chosen files are put together with it
+// (merge_saves). Any other source, and REPLACE ALL SAVES, waits for the player's Replace and is placed whole. Either is
+// written with the replaced files backed up, and the game starts again to read it. An export is made in the settings
+// folder's .export and copied where the player chooses (host_window::save_copy).
+std::mutex s_saves_mutex;
+std::atomic<ui::SavesStep> s_saves_step{ui::SavesStep::Idle};
+std::shared_ptr<const galaxy::save_transfer::ImportPlan> s_saves_plan;  // under s_saves_mutex: the plan Confirm asks about
+bool s_saves_replace = false;                                            // under s_saves_mutex
+std::string s_saves_import_status;                                       // under s_saves_mutex
+std::string s_saves_export_status;                                       // under s_saves_mutex
+
+// The choice file by file, under s_saves_mutex: the picked save as the plan holds it, the game's reading of it in
+// Nebula.sav's form, both saves' files and where each imported one goes.
+struct SavesByFile {
+    std::shared_ptr<const std::vector<std::byte>> source;
+    std::vector<std::byte> imported;
+    ui::SaveImportFiles imported_files{};
+    ui::SaveImportFiles current_files{};
+    ui::SaveImportTargets targets{};
+};
+std::optional<SavesByFile> s_saves_by_file;
+// One more at each pick and each end of an import: the game's answer to an earlier import's read is dropped.
+std::uint64_t s_saves_generation = 0;  // under s_saves_mutex
+
+// A read asked of the game: the source it reads (kept until the answer), the import it is for, and whether it is the
+// write's.
+struct SavesRead {
+    std::shared_ptr<const std::vector<std::byte>> source;
+    std::uint64_t generation = 0;
+    bool writing = false;
+};
+
+const char* saves_import_text(const galaxy::save_transfer::ImportPlan& plan) {
+    using galaxy::save_transfer::Error;
+    if (plan.kind == galaxy::save_transfer::Kind::kDatelSave) return "ACTION REPLAY SAVES CANNOT BE READ";
+    switch (plan.error) {
+    case Error::kNewerVersion: return "THIS SAVE IS FROM A NEWER VERSION OF NEBULA";
+    case Error::kDamaged: return "THIS SAVE IS DAMAGED";
+    case Error::kWrongGame: return "THIS SAVE IS FROM ANOTHER GAME";
+    case Error::kWrongRegion: return "THIS FILE HAS NO SAVE FOR THIS VERSION OF THE GAME";
+    case Error::kTooLarge: return "THIS FILE IS TOO LARGE TO BE A SAVE";
+    case Error::kNoSaves: return "NO SAVE WAS FOUND IN THIS FILE";
+    case Error::kIo: return "THE FILE COULD NOT BE READ";
+    default: return "THIS FILE IS NOT A SAVE NEBULA CAN READ";
+    }
+}
+
+void saves_import_status(std::string text) {
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    s_saves_import_status = std::move(text);
+}
+
+// With s_saves_mutex held: the import over, its status shown on the IMPORT SAVES row.
+void end_saves_import_locked(std::string status) {
+    s_saves_import_status = std::move(status);
+    s_saves_plan.reset();
+    s_saves_by_file.reset();
+    ++s_saves_generation;
+    s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+}
+
+ui::SaveImportFiles saves_files(const NebulaSaveImportFile* files) {
+    ui::SaveImportFiles out{};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = {files[i].exists != 0u, files[i].damaged != 0u, files[i].luigi != 0u, files[i].stars};
+    }
+    return out;
+}
+
+std::vector<std::byte> saves_bytes(const std::uint8_t* bytes, std::uint32_t length) {
+    const std::byte* const first = reinterpret_cast<const std::byte*>(bytes);
+    return std::vector<std::byte>(first, first + length);
+}
+
+// A written import: the game starts again to read it (the step stays Importing until it closes).
+void finish_saves_import(const galaxy::save_transfer::ImportResult& result) {
+    if (result.error != galaxy::save_transfer::Error::kNone) {
+        std::cerr << "[settings] save import failed: error " << static_cast<int>(result.error) << '\n';
+        saves_import_status("THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED");
+        s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+        return;
+    }
+    std::cerr << "[settings] save imported: " << result.written << " files; replaced files in "
+              << galaxy::path_text(result.backup) << '\n';
+    if (host_window::restart_game(host_window::Restart::Start)) return;
+    saves_import_status("SAVE IMPORTED. CLOSE AND REOPEN NEBULA TO PLAY IT");
+    s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+}
+
+// Off the game thread: the chosen files put together with the save as the game read it at the write, then placed.
+void write_saves_by_file(std::vector<std::byte> current, SavesByFile choice) {
+    galaxy::save_transfer::ImportResult result;
+    std::vector<std::byte> merged;
+    result.error = galaxy::save_transfer::merge_saves(current, choice.imported, choice.targets, &merged);
+    if (result.error == galaxy::save_transfer::Error::kNone) {
+        const galaxy::save_transfer::ImportPlan plan =
+            galaxy::save_transfer::plan_native_save(std::move(merged), galaxy::save_transfer::game_code());
+        result = plan.error == galaxy::save_transfer::Error::kNone
+                     ? galaxy::save_transfer::commit_import(plan, galaxy::save_transfer::game_save_root())
+                     : galaxy::save_transfer::ImportResult{plan.error, {}, 0};
+    }
+    finish_saves_import(result);
+}
+
+// The game's answer (nebula_save_import.h), on the game thread: the choice's facts, or the write's save.
+void saves_read_done(void* context, std::int32_t status, const std::uint8_t* imported, std::uint32_t imported_length,
+                     const NebulaSaveImportFile* imported_files, const std::uint8_t* current, std::uint32_t current_length,
+                     const NebulaSaveImportFile* current_files) {
+    const std::unique_ptr<SavesRead> read(static_cast<SavesRead*>(context));
+    std::cerr << "[settings] save import: the game's read: status " << status << (read->writing ? ", to write\n" : "\n");
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    const ui::SavesStep waiting = read->writing ? ui::SavesStep::Importing : ui::SavesStep::Reading;
+    if (read->generation != s_saves_generation || s_saves_step.load(std::memory_order_acquire) != waiting) {
+        return;  // cancelled meanwhile
+    }
+    if (status != NEBULA_SAVE_IMPORT_OK) {
+        end_saves_import_locked(read->writing                          ? "THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED"
+                                : status == NEBULA_SAVE_IMPORT_DAMAGED ? "THIS SAVE IS DAMAGED"
+                                                                       : "THE GAME COULD NOT READ THIS SAVE");
+        return;
+    }
+    try {
+        const ui::SaveImportFiles now = saves_files(current_files);
+        if (!read->writing) {
+            SavesByFile choice;
+            choice.source = read->source;
+            choice.imported = saves_bytes(imported, imported_length);
+            choice.imported_files = saves_files(imported_files);
+            choice.current_files = now;
+            if (std::none_of(choice.imported_files.begin(), choice.imported_files.end(),
+                             [](const ui::SaveImportFile& file) { return file.exists || file.damaged; })) {
+                end_saves_import_locked("THIS SAVE HAS NO FILES");
+                return;
+            }
+            choice.targets = ui::save_import_first_targets(choice.imported_files, now);
+            s_saves_by_file = std::move(choice);
+            s_saves_import_status.clear();
+            s_saves_step.store(ui::SavesStep::Confirm, std::memory_order_release);
+            return;
+        }
+        if (!s_saves_by_file) {
+            end_saves_import_locked("THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED");
+            return;
+        }
+        // A file the choice places that was added, removed or damaged since it was shown: chosen anew.
+        const SavesByFile& choice = *s_saves_by_file;
+        for (const std::uint8_t target : choice.targets) {
+            if (target == 0u) continue;
+            const ui::SaveImportFile& was = choice.current_files[target - 1u];
+            const ui::SaveImportFile& is = now[target - 1u];
+            if (was.exists != is.exists || was.damaged != is.damaged) {
+                end_saves_import_locked("YOUR SAVES CHANGED. IMPORT THE FILE AGAIN");
+                return;
+            }
+        }
+        std::thread(write_saves_by_file, saves_bytes(current, current_length), std::move(*s_saves_by_file)).detach();
+        s_saves_by_file.reset();
+        s_saves_plan.reset();
+    } catch (...) {
+        end_saves_import_locked(read->writing ? "THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED"
+                                              : "THE GAME COULD NOT READ THIS SAVE");  // out of memory
+    }
+}
+
+// The game asked to read `read`'s source; false when it takes none now (no module half, or a read waits).
+bool ask_game_read(std::unique_ptr<SavesRead> read) {
+    const NebulaSaveImportRead reader = galaxy::save_transfer::game_reader();
+    if (reader == nullptr || !read->source || read->source->empty() || read->source->size() > UINT32_MAX) return false;
+    const std::uint8_t* const bytes = reinterpret_cast<const std::uint8_t*>(read->source->data());
+    const std::uint32_t length = static_cast<std::uint32_t>(read->source->size());
+    SavesRead* const context = read.release();
+    if (reader(bytes, length, saves_read_done, context) == NEBULA_SAVE_IMPORT_OK) return true;
+    delete context;
+    return false;
+}
+
+// The import of `file`, read as `read` (the picker's file, or a save dropped on the window or opened with the game);
+// the step is Choosing. A failed read ends the import with its reason; a save of this release goes to the game to be
+// read file by file; anything else is asked as a whole import.
+void begin_saves_import(const std::filesystem::path& file, galaxy::save_transfer::ImportPlan read_plan) {
+    const std::filesystem::path root = galaxy::save_transfer::game_save_root();
+    auto plan = std::make_shared<galaxy::save_transfer::ImportPlan>(std::move(read_plan));
+    std::cerr << "[settings] save import: " << galaxy::path_text(file) << ": error " << static_cast<int>(plan->error) << ", "
+              << plan->files.size() << " files\n";
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    ++s_saves_generation;
+    if (plan->error != galaxy::save_transfer::Error::kNone) {
+        end_saves_import_locked(saves_import_text(*plan));
+        return;
+    }
+    s_saves_replace = galaxy::save_transfer::replaces_saves(*plan, root);
+    s_saves_import_status.clear();
+    // A save of this release: placed file by file once the game has read it (the reader never answers inside its
+    // call, so the lock held here is not wanted by it).
+    if (const galaxy::save_transfer::SaveFile* const save = galaxy::save_transfer::release_save(*plan); save != nullptr) {
+        auto read = std::make_unique<SavesRead>();
+        read->source = std::make_shared<const std::vector<std::byte>>(save->bytes);
+        read->generation = s_saves_generation;
+        s_saves_plan = plan;
+        s_saves_step.store(ui::SavesStep::Reading, std::memory_order_release);
+        if (ask_game_read(std::move(read))) return;
+        std::cerr << "[settings] save import: the game takes no read now; the import is whole\n";
+    }
+    s_saves_plan = std::move(plan);
+    s_saves_step.store(ui::SavesStep::Confirm, std::memory_order_release);
+}
+
+void start_saves_import() {
+    if (!opens_on_desktop("the save picker")) return;
+    ui::SavesStep idle = ui::SavesStep::Idle;
+    if (!s_saves_step.compare_exchange_strong(idle, ui::SavesStep::Choosing, std::memory_order_acq_rel)) return;
+    host_window::pick_files(host_window::FilePick::Saves, [](std::vector<std::filesystem::path> files) {
+        if (files.empty()) {
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        begin_saves_import(files.front(), galaxy::save_transfer::plan_import(files.front(), galaxy::save_transfer::game_code()));
+    });
+}
+
+void cancel_saves_import() {
+    const ui::SavesStep step = s_saves_step.load(std::memory_order_acquire);
+    if (step != ui::SavesStep::Confirm && step != ui::SavesStep::Reading) return;
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    ui::SavesStep expected = step;
+    if (!s_saves_step.compare_exchange_strong(expected, ui::SavesStep::Idle, std::memory_order_acq_rel)) return;
+    s_saves_plan.reset();
+    s_saves_by_file.reset();
+    ++s_saves_generation;
+}
+
+// The player chose Import (the choice file by file: the game reads the save again first) or Replace (the plan whole):
+// written off the menu's thread, then the game starts again (it reads the save at its start).
+void confirm_saves_import(bool whole) {
+    ui::SavesStep confirm = ui::SavesStep::Confirm;
+    if (!s_saves_step.compare_exchange_strong(confirm, ui::SavesStep::Importing, std::memory_order_acq_rel)) return;
+    std::shared_ptr<const galaxy::save_transfer::ImportPlan> plan;
+    {
+        const std::lock_guard<std::mutex> lock(s_saves_mutex);
+        if (!whole && s_saves_by_file) {
+            auto read = std::make_unique<SavesRead>();
+            read->source = s_saves_by_file->source;
+            read->generation = s_saves_generation;
+            read->writing = true;
+            if (!ask_game_read(std::move(read))) {
+                end_saves_import_locked("THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED");
+            }
+            return;
+        }
+        plan = std::move(s_saves_plan);
+        s_saves_by_file.reset();
+    }
+    if (!plan) {
+        s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+        return;
+    }
+    std::thread([plan] {
+        finish_saves_import(galaxy::save_transfer::commit_import(*plan, galaxy::save_transfer::game_save_root()));
+    }).detach();
+}
+
+void start_saves_export() {
+    if (!opens_on_desktop("the save dialog")) return;
+    ui::SavesStep idle = ui::SavesStep::Idle;
+    if (!s_saves_step.compare_exchange_strong(idle, ui::SavesStep::Exporting, std::memory_order_acq_rel)) return;
+    std::thread([] {
+        const std::filesystem::path folder = galaxy::runtime_settings_folder() / ".export";
+        std::error_code error;
+        std::filesystem::remove_all(folder, error);
+        const galaxy::save_transfer::ExportResult made =
+            galaxy::save_transfer::export_saves(galaxy::save_transfer::game_save_root(), folder, NEBULA_VERSION);
+        if (made.error != galaxy::save_transfer::Error::kNone) {
+            {
+                const std::lock_guard<std::mutex> lock(s_saves_mutex);
+                s_saves_export_status = made.error == galaxy::save_transfer::Error::kNoSaves ? "NO SAVES TO EXPORT YET"
+                                                                                             : "THE SAVES COULD NOT BE EXPORTED";
+            }
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        host_window::save_copy(made.file, [folder](host_window::SaveCopy copied) {
+            {
+                const std::lock_guard<std::mutex> lock(s_saves_mutex);
+                s_saves_export_status = copied == host_window::SaveCopy::Saved    ? "SAVES EXPORTED"
+                                        : copied == host_window::SaveCopy::Failed ? "THE SAVES COULD NOT BE EXPORTED"
+                                                                                  : "";
+            }
+            std::error_code ignored;
+            std::filesystem::remove_all(folder, ignored);
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+        });
+    }).detach();
+}
 
 // The MODS page: the mods folder's mods (galaxy::mods), read when the page first shows and on a rescan (pages are
 // rebuilt for every draw). Which are on, their order and their choices are a draft until Apply saves them to mods.ini
@@ -4448,9 +4766,24 @@ public:
         }
         state.choosing_miis = s_mii_dialog_open.load(std::memory_order_acquire);
         state.folders_open = host_window::folders_open();
-#if defined(_WIN32)
-        state.focus_loss_offered = true;  // the Windows host pauses or mutes a game whose window is not in front (host_main.cpp)
-#endif
+        state.saves_offered = !galaxy::save_transfer::game_save_root().empty() && !galaxy::save_transfer::game_code().empty();
+        state.saves_step = s_saves_step.load(std::memory_order_acquire);
+        {
+            const std::lock_guard<std::mutex> lock(s_saves_mutex);
+            state.saves_replace = s_saves_replace;
+            state.saves_import_status = s_saves_import_status;
+            state.saves_export_status = s_saves_export_status;
+            if (s_saves_by_file) {
+                state.saves_by_file = true;
+                state.saves_whole_offered = s_saves_plan && galaxy::save_transfer::places_more_than_save(*s_saves_plan);
+                state.import_files = s_saves_by_file->imported_files;
+                state.current_files = s_saves_by_file->current_files;
+                state.import_targets = s_saves_by_file->targets;
+            }
+        }
+        // The desktop hosts pause or mute a game whose window is not in front (host_main.cpp follow_focus_loss).
+        state.focus_loss_offered = galaxy::kDesktopWindow;
+        state.discord_offered = galaxy::discord::supported();
         state.mii_count = s_mii_count.load(std::memory_order_acquire);
         if (state.mii_count < 0) {
             state.mii_count = static_cast<int>(galaxy::host::mii_library_count());
@@ -4459,8 +4792,21 @@ public:
         return state;
     }
     void act(ui::GeneralPageAction action) const override {
-        if (action == ui::GeneralPageAction::ImportMiis) start_mii_import_dialog();
-        else if (action == ui::GeneralPageAction::OpenMiiFolder) open_mii_folder();
+        switch (action) {
+        case ui::GeneralPageAction::ImportMiis: start_mii_import_dialog(); break;
+        case ui::GeneralPageAction::OpenMiiFolder: open_mii_folder(); break;
+        case ui::GeneralPageAction::ImportSaves: start_saves_import(); break;
+        case ui::GeneralPageAction::ConfirmImport: confirm_saves_import(false); break;
+        case ui::GeneralPageAction::ReplaceAllSaves: confirm_saves_import(true); break;
+        case ui::GeneralPageAction::CancelImport: cancel_saves_import(); break;
+        case ui::GeneralPageAction::ExportSaves: start_saves_export(); break;
+        case ui::GeneralPageAction::OpenSaveFolder: open_folder_in_explorer(galaxy::save_transfer::game_save_root()); break;
+        }
+    }
+    void step_import_target(unsigned file, int delta) const override {
+        if (s_saves_step.load(std::memory_order_acquire) != ui::SavesStep::Confirm) return;
+        const std::lock_guard<std::mutex> lock(s_saves_mutex);
+        if (s_saves_by_file) ui::save_import_step(s_saves_by_file->targets, file, delta);
     }
 };
 
@@ -4475,7 +4821,67 @@ std::vector<SettingsRow> advanced_page() {
     return s_advanced_page.rows([] { set_native_settings_visible(false); });
 }
 
+// The RENDERER row's view. On Windows x64 (where Nebula.exe hands a start to another renderer's program) the choice:
+// the renderer check's answers for the card the next start renders on, with what is known without it (a renderer whose
+// program is not here does not run; the one running runs on its card).
+ui::RendererPickerView renderer_picker_view(const RenderFeatureCaps& caps) {
+    ui::RendererPickerView view;
+    view.running = running_renderer();
+#if defined(_WIN32) && defined(_M_X64)
+    // A renderer given on the command line wins over the settings, and a restart keeps it: the row only shows it.
+    if (::galaxy::launch_args().renderer != 0u) {
+        return view;
+    }
+    const RendererCheck check = renderer_check();
+    view.checked = check.done;
+    view.next = next_start_renderer();
+    // Not changed since this start: a restart runs this program again (host_main renderer_restart_program), whatever
+    // the automatic choice would pick for a new start.
+    if (static_cast<unsigned>(view.next) == get_render_config().renderer) {
+        view.next = view.running;
+    }
+    const std::string next_gpu = next_start_gpu();
+    view.card = renderers_for(check.cards, next_gpu);
+    static const std::array<bool, kRendererPreference.size()> installed = [] {
+        std::array<bool, kRendererPreference.size()> here{};
+        for (std::size_t i = 0u; i < here.size(); ++i) here[i] = !renderer_program(kRendererPreference[i]).empty();
+        return here;
+    }();
+    for (std::size_t i = 0u; i < installed.size(); ++i) {
+        if (!installed[i]) view.card.set(kRendererPreference[i], RendererRefusal::kNotInstalled);
+    }
+    if (next_gpu.empty() || next_gpu == gpu_identity(caps.adapter_vendor_id, caps.adapter_device_id, caps.adapter_subsys_id)) {
+        view.card.set(view.running, RendererRefusal::kNone);
+    }
+    view.choose = [](RendererKind kind) { (void)choose_next_start_renderer(kind); };
+#else
+    (void)caps;
+#endif
+    return view;
+}
+
+// The GPU the next start renders on, with the newest renderer it runs (the renderer check's answer; the automatic
+// choice where the check has none or the GPU is the automatic choice).
+void choose_gpu_and_renderer(const std::string& identity) {
+    RendererKind renderer = RendererKind::kAuto;
+#if defined(_WIN32) && defined(_M_X64)
+    if (const RendererCheck check = renderer_check(); !identity.empty() && check.done && !check.cards.empty()) {
+        renderer = preferred_renderer(renderers_for(check.cards, identity));
+    }
+#endif
+    (void)choose_next_start_gpu(identity, renderer);
+}
+
 std::vector<SettingsRow> system_page(const RenderFeatureCaps& caps) {
+    // DIAGNOSTICS' Record restarts into a recorded run, where the game can start again.
+    void (*const record_diagnostics)() =
+        host_window::can_restart() ? +[] { s_diagnostics_ask.store(true, std::memory_order_release); } : nullptr;
+    // BENCHMARK: its recommendation goes into the draft as changes to apply.
+    const ui::BenchmarkView benchmark = ui::benchmark_menu::rows(
+        s_settings_draft, caps.adapter_description.data(), [](const RenderConfig& recommended) {
+            s_settings_draft = recommended;
+            sanitize_settings_draft(s_settings_draft);
+        });
     ui::GpuTimingView timing;
     timing.on = gpu_timing_on();
     timing.toggle = [] { set_gpu_timing(!gpu_timing_on()); };
@@ -4486,8 +4892,72 @@ std::vector<SettingsRow> system_page(const RenderFeatureCaps& caps) {
             timing.passes.emplace_back(times[i].name, times[i].ms);
         }
     }
-    return ui::system_page(caps, post_process_caps_text(get_post_process_status()),
-                           [] { s_diagnostics_ask.store(true, std::memory_order_release); }, &timing);
+    ui::GpuPickerView gpus;
+    gpus.choices = gpu_choices();
+    gpus.next = next_start_gpu();
+    gpus.choose = choose_gpu_and_renderer;
+    const ui::RendererPickerView renderers = renderer_picker_view(caps);
+#if defined(NEBULA_UPDATE_CHECK)
+    namespace update = galaxy::update;
+    const update::CheckState check = update::check_state();
+    if (check != update::CheckState::Unavailable) {
+        ui::UpdatesView updates;
+        updates.check_at_start = update::check_enabled();
+        updates.toggle = [] { update::set_check_enabled(!update::check_enabled()); };
+        updates.check = [] { (void)update::check_now(NEBULA_VERSION); };
+        updates.can_install = update::can_install();
+#if defined(_WIN32)
+        updates.closes_game = true;
+#endif
+        const std::optional<update::Release> release = update::poll();
+        if (release) updates.version = release->version;
+        const update::InstallProgress install = update::install_progress();
+        switch (install.state) {
+        case update::InstallState::Downloading:
+            updates.step = ui::UpdateStep::Downloading;
+            updates.percent = install.total != 0u ? static_cast<unsigned>(install.bytes * 100u / install.total) : 0u;
+            break;
+        case update::InstallState::Verifying:
+        case update::InstallState::Installing: updates.step = ui::UpdateStep::Installing; break;
+        case update::InstallState::Restart: updates.step = ui::UpdateStep::Restart; break;
+        case update::InstallState::Failed: updates.step = ui::UpdateStep::InstallFailed; break;
+        default:
+            switch (check) {
+            case update::CheckState::Checking: updates.step = ui::UpdateStep::Checking; break;
+            case update::CheckState::UpToDate: updates.step = ui::UpdateStep::UpToDate; break;
+            case update::CheckState::Failed: updates.step = ui::UpdateStep::CheckFailed; break;
+            case update::CheckState::Available: updates.step = ui::UpdateStep::Available; break;
+            default: updates.step = ui::UpdateStep::NotChecked; break;
+            }
+            break;
+        }
+        if (updates.step != ui::UpdateStep::NotChecked && updates.step != ui::UpdateStep::Checking &&
+            updates.step != ui::UpdateStep::UpToDate && updates.step != ui::UpdateStep::CheckFailed && updates.version.empty()) {
+            updates.step = ui::UpdateStep::NotChecked;  // no release in hand (an install's state outlived it)
+        }
+        updates.install = [] {
+            const std::optional<update::Release> offered = update::poll();
+            if (!offered) return;
+#if defined(_WIN32)
+            // Nebula Setup downloads, checks and installs it once the game has closed.
+            if (update::start_setup_update()) {
+                host_window::quit_game();
+            } else {
+                show_controls_message("NEBULA SETUP COULD NOT START");
+            }
+#else
+            if (!update::start_install(*offered)) show_controls_message("THE UPDATE COULD NOT START");
+#endif
+        };
+        updates.restart = [] {
+            if (!host_window::restart_game(host_window::Restart::Start)) show_controls_message("COULD NOT RESTART");
+        };
+        return ui::system_page(caps, post_process_caps_text(get_post_process_status()), record_diagnostics, &timing, &gpus,
+                               &updates, &benchmark, &renderers);
+    }
+#endif
+    return ui::system_page(caps, post_process_caps_text(get_post_process_status()), record_diagnostics, &timing, &gpus,
+                           nullptr, &benchmark, &renderers);
 }
 
 std::vector<SettingsRow> settings_page(unsigned tab, const RenderConfig& draft, const RuntimeSettings& runtime,
@@ -4863,7 +5333,7 @@ bool dlss_prompt_key(std::uintptr_t key, bool was_down) {
             s_vendor_offer = VendorOffer::None;
         } else if (key == VK_RETURN) {
             s_vendor_offer = VendorOffer::None;
-            if (host_window::restart_game(false)) {
+            if (host_window::restart_game(host_window::Restart::Start)) {
                 std::cerr << "[download] restarting\n";
             }
         }
@@ -4884,7 +5354,7 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
         s_mods_restart_ask.store(false, std::memory_order_release);
         s_rt_restart_ask.store(false, std::memory_order_release);
         const bool record = s_diagnostics_ask.exchange(false, std::memory_order_acq_rel);
-        if (host_window::restart_game(record)) {
+        if (host_window::restart_game(record ? host_window::Restart::Diagnostics : host_window::Restart::Start)) {
             std::cerr << (record ? "[settings] restarting into a diagnostics run\n" : "[settings] restarting\n");
         } else {
             show_controls_message("COULD NOT RESTART");
@@ -5229,6 +5699,12 @@ void poll_render_config_file() {
     }
 }
 
+// A renderer chosen in Nebula Settings during the session that is not the one the game runs on.
+bool renderer_change_pending(const RenderFeatureCaps& caps) {
+    const ui::RendererPickerView view = renderer_picker_view(caps);
+    return view.choose && view.checked && ui::shown_renderer(view) != view.running;
+}
+
 // A GPU chosen in Nebula Settings during the session that is not the one the game runs on.
 bool gpu_change_pending(const RenderConfig& render, const RenderFeatureCaps& caps) {
     const std::string next = next_start_gpu();
@@ -5250,17 +5726,38 @@ void open_native_settings(unsigned page) {
     set_native_settings_visible(true);
 }
 
-void open_native_settings_draft(unsigned page, const RenderConfig& draft) {
+void open_native_settings_results(const std::filesystem::path& result) {
     const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
-    open_native_settings(page);
-    s_settings_draft = draft;
-    sanitize_settings_draft(s_settings_draft);
-    std::cerr << "[settings] opened with " << pending_settings_changes() << " recommended change"
-              << (pending_settings_changes() == 1u ? "" : "s") << '\n';
+    open_native_settings(kSystemTab);
+    if (!ui::benchmark_menu::open_results(result)) {
+        std::cerr << "[settings] the benchmark's result could not be read: SYSTEM opened\n";
+    }
 }
 
 void native_settings_present() {
     poll_dlss_download();
+}
+
+// The hints show the buttons the icons do: a chosen style whatever is in hand (the keyboard's: its keys), else what
+// the player last used. NEBULA_SETTINGS_INPUT_*.
+static unsigned hint_input() {
+    const ButtonIcons icons = get_runtime_settings().button_icons;
+    if (icons == ButtonIcons::Xbox || icons == ButtonIcons::Nintendo || icons == ButtonIcons::PlayStation) {
+        return icons == ButtonIcons::Xbox ? 1u : icons == ButtonIcons::Nintendo ? 2u : 3u;
+    }
+    const auto device = galaxy::host::last_input_device();
+#if defined(__ANDROID__)
+    // Touch: no keys or buttons to name.
+    if (icons == ButtonIcons::Auto && !device) return 4u;  // NEBULA_SETTINGS_INPUT_TOUCH
+#endif
+    if (!device || icons == ButtonIcons::Keyboard) return 0u;
+    switch (device->scheme) {
+    case galaxy::input::ControlScheme::Keyboard: return 0u;
+    case galaxy::input::ControlScheme::SwitchPro:
+    case galaxy::input::ControlScheme::SwitchPro2: return 2u;
+    case galaxy::input::ControlScheme::PlayStation: return 3u;
+    default: return 1u;
+    }
 }
 
 // The menu as it stands: its pages, the open page's rows (label, value, a heading or not, whether it changes), the
@@ -5271,26 +5768,7 @@ NativeSettingsView build_native_settings_view() {
         view.pages.push_back(kNativeSettingsTabNames[shown]);
     }
     view.controls_page = shown_position(kControlsTab);
-    // The hints show the buttons the icons do: a chosen style whatever is in hand (the keyboard's: its keys), else what
-    // the player last used.
-    const ButtonIcons icons = get_runtime_settings().button_icons;
-#if defined(__ANDROID__)
-    // Touch: no keys or buttons to name.
-    if (icons == ButtonIcons::Auto && !galaxy::host::last_input_device()) {
-        view.input = 4u;  // NEBULA_SETTINGS_INPUT_TOUCH
-    }
-#endif
-    if (icons == ButtonIcons::Xbox || icons == ButtonIcons::Nintendo || icons == ButtonIcons::PlayStation) {
-        view.input = icons == ButtonIcons::Xbox ? 1u : icons == ButtonIcons::Nintendo ? 2u : 3u;
-    } else if (const auto device = galaxy::host::last_input_device(); device && icons != ButtonIcons::Keyboard) {
-        switch (device->scheme) {
-        case galaxy::input::ControlScheme::Keyboard: break;
-        case galaxy::input::ControlScheme::SwitchPro:
-        case galaxy::input::ControlScheme::SwitchPro2: view.input = 2u; break;
-        case galaxy::input::ControlScheme::PlayStation: view.input = 3u; break;
-        default: view.input = 1u; break;
-        }
-    }
+    view.input = hint_input();
     view.open = s_native_settings_visible.load(std::memory_order_relaxed);
     const unsigned tab = s_native_settings_tab.load(std::memory_order_relaxed) % kNativeSettingsTabCount;
     view.page = shown_position(tab);
@@ -5339,7 +5817,7 @@ NativeSettingsView build_native_settings_view() {
                 shown.label.resize(colon);
             }
         }
-        shown.name = shown.name || (tab == 0u && shown.label == "MONITOR") || (tab == 6u && shown.label == "GRAPHICS CARD") ||
+        shown.name = shown.name || (tab == 0u && shown.label == "MONITOR") ||
                      (tab == 4u && (shown.label == "GALAXY" || shown.label == "STAR"));
         if (tab == kControlsTab) {
             // The controller being set up by its own name (the overlay's row has it in capitals), and the bindings as
@@ -5475,6 +5953,8 @@ NativeSettingsView build_native_settings_view() {
         }
     } else if (tab == kModsTab && fill_mod_question_view(view)) {
         // The mod page's ABOUT or REMOVE.
+    } else if (ui::benchmark_menu::fill(view)) {
+        // The benchmark's questions and results window.
     } else if (s_settings_leave_asking) {
         view.status = NativeSettingsStatus::Leave;
         view.status_number = static_cast<int>(pending_settings_changes());
@@ -5514,6 +5994,8 @@ NativeSettingsView build_native_settings_view() {
         view.status = NativeSettingsStatus::ModsRestart;
     } else if (tab == 6u && gpu_change_pending(row_render, row_caps)) {
         view.status = NativeSettingsStatus::GpuRestart;
+    } else if (tab == 6u && renderer_change_pending(row_caps)) {
+        view.status = NativeSettingsStatus::RendererRestart;
     }
     return view;
 }
@@ -5542,6 +6024,10 @@ HostClientExtent aspect_latch_extent() noexcept {
     return client;
 }
 
+unsigned native_settings_hint_input() {
+    return host_window::hint_input();
+}
+
 bool native_settings_overlay_visible() noexcept {
     return s_native_settings_visible.load(std::memory_order_relaxed);
 }
@@ -5559,7 +6045,7 @@ bool sharp_2d_requested() noexcept {
 }
 
 bool native_window_input_captured() noexcept {
-    return s_native_settings_visible.load(std::memory_order_relaxed) ||
+    return galaxy::bench::running() || s_native_settings_visible.load(std::memory_order_relaxed) ||
         s_home_menu.visible.load(std::memory_order_relaxed) || galaxy::ui::launcher_visible() ||
         host_window::window_modal_active();
 }
@@ -5609,21 +6095,79 @@ bool native_settings_wheel(int delta) {
     return true;
 }
 
-// Dropped files: mod archives and folders into the mods folder (the MODS page opens on the import), anything else to
-// the Mii import.
-void native_settings_files_dropped(std::vector<std::filesystem::path> files) {
+namespace {
+
+// Dropped files, sorted (route_dropped_files).
+struct DroppedFiles {
+    std::optional<std::pair<std::filesystem::path, galaxy::save_transfer::ImportPlan>> save;  // the first save
+    unsigned more_saves = 0;  // saves after it, left out: the import takes one save at a time
     std::vector<std::filesystem::path> mods;
     std::vector<std::filesystem::path> miis;
+    bool link = false;
+};
+
+DroppedFiles sort_dropped_files(std::vector<std::filesystem::path> files) {
+    DroppedFiles sorted;
+    const std::string code = galaxy::save_transfer::game_code();  // empty without a save folder: no save import
     for (std::filesystem::path& path : files) {
         std::error_code error;
+        if (galaxy::path_text(path).rfind("nebula:", 0) == 0) {
+            sorted.link = true;
+            continue;
+        }
+        if (!code.empty()) {
+            galaxy::save_transfer::ImportPlan plan = galaxy::save_transfer::plan_import(path, code);
+            if (galaxy::save_transfer::is_save_source(path, plan)) {
+                if (sorted.save) {
+                    ++sorted.more_saves;
+                } else {
+                    sorted.save.emplace(std::move(path), std::move(plan));
+                }
+                continue;
+            }
+        }
         if (std::filesystem::is_directory(path, error) || galaxy::mods::is_mod_archive(path)) {
-            mods.push_back(std::move(path));
+            sorted.mods.push_back(std::move(path));
         } else {
-            miis.push_back(std::move(path));
+            sorted.miis.push_back(std::move(path));
         }
     }
-    if (!mods.empty()) {
-        run_mod_imports(std::move(mods));
+    return sorted;
+}
+
+// The GENERAL page open on the save import's row.
+void open_saves_rows() {
+    const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
+    host_window::open_native_settings(kGeneralTab);
+    const auto rows = settings_page(kGeneralTab, s_settings_draft, s_runtime_draft, get_render_feature_caps());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].label == "IMPORT SAVES") {
+            s_native_settings_row.store(static_cast<unsigned>(i), std::memory_order_relaxed);
+            break;
+        }
+    }
+    s_native_settings_button_row.store(~0u, std::memory_order_relaxed);
+}
+
+void route_dropped_files(std::vector<std::filesystem::path> files) {
+    DroppedFiles sorted = sort_dropped_files(std::move(files));
+    std::vector<std::filesystem::path>& mods = sorted.mods;
+    std::vector<std::filesystem::path>& miis = sorted.miis;
+    const bool link = sorted.link;
+    if (sorted.save) {
+        if (sorted.more_saves != 0u) {
+            std::cerr << "[settings] save import (dropped): " << sorted.more_saves << " more saves left out\n";
+        }
+        ui::SavesStep idle = ui::SavesStep::Idle;
+        if (s_saves_step.compare_exchange_strong(idle, ui::SavesStep::Choosing, std::memory_order_acq_rel)) {
+            begin_saves_import(sorted.save->first, std::move(sorted.save->second));
+        } else {
+            std::cerr << "[settings] save import (dropped): another import or export is running\n";
+        }
+        if (mods.empty() && !link) open_saves_rows();
+    }
+    if (!mods.empty() || link) {
+        if (!mods.empty()) run_mod_imports(std::move(mods));
         const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
         s_native_settings_tab.store(kModsTab, std::memory_order_relaxed);
         s_native_settings_row.store(1u, std::memory_order_relaxed);
@@ -5642,6 +6186,36 @@ void native_settings_files_dropped(std::vector<std::filesystem::path> files) {
             s_mii_count.store(-1, std::memory_order_release);
         }).detach();
     }
+}
+
+}  // namespace
+
+// Dropped files (and the files the game was opened with): a save to the save import (the GENERAL page opens on it),
+// mod archives and folders into the mods folder (the MODS page opens on the import), anything else to the Mii import.
+// A nebula:// link (the system's Open with a link, --import) opens the MODS page: importing by link waits on
+// net.internet. Sorted off the caller's thread (the window's): a save is told from a mod or a Mii file by reading it.
+void native_settings_files_dropped(std::vector<std::filesystem::path> files) {
+    std::thread([files = std::move(files)]() mutable {
+        // An exception out of this thread ends the process: a drop that could not be sorted is left.
+        try {
+            route_dropped_files(std::move(files));
+        } catch (const std::exception& failure) {
+            std::cerr << "[settings] dropped files: " << failure.what() << '\n';
+        }
+    }).detach();
+}
+
+namespace {
+std::atomic<bool> s_launch_imports_taken{false};
+}  // namespace
+
+std::vector<std::filesystem::path> native_settings_take_launch_imports() {
+    if (::galaxy::launch_args().imports.empty() || s_launch_imports_taken.exchange(true, std::memory_order_acq_rel)) return {};
+    return ::galaxy::launch_args().imports;
+}
+
+bool native_settings_launch_imports_taken() noexcept {
+    return s_launch_imports_taken.load(std::memory_order_acquire);
 }
 
 // A size the player drags the window to becomes the windowed size. Saved now, not when the game closes: Nebula Settings
@@ -5664,13 +6238,19 @@ NativeSettingsView native_settings_view() {
     return host_window::build_native_settings_view();
 }
 
+// A save import that waits on the player: the game reading the picked save for the choice, or the choice itself.
+static bool saves_import_asking() {
+    const ui::SavesStep step = s_saves_step.load(std::memory_order_acquire);
+    return step == ui::SavesStep::Reading || step == ui::SavesStep::Confirm;
+}
+
 // Whether the menu asks the player something: a question over the page, changes not applied (closing would ask first),
-// or a screen of the Mods page (an import running or its result waiting for its Done, a file dialog, a mod's request,
-// the consent question).
+// a save import's choice, or a screen of the Mods page (an import running or its result waiting for its Done, a file
+// dialog, a mod's request, the consent question).
 static bool native_settings_asking() {
     return s_settings_leave_asking || s_joycon_pairing || galaxy::host::touch_arranging() || settings_display_confirming() ||
            restart_asking() || vendor_prompting() || mod_question_up() || pending_settings_changes() != 0u ||
-           screens_screen_up();
+           saves_import_asking() || screens_screen_up() || ui::benchmark_menu::up();
 }
 
 void native_settings_reopen_held() {
@@ -5719,7 +6299,7 @@ void native_settings_input(NativeSettingsInput input, int arg) {
     }
     // The page and its rows wait while a question is up (keep the display? leave without applying?).
     if (!visible || s_settings_leave_asking || s_joycon_pairing || galaxy::host::touch_arranging() || settings_display_confirming() ||
-        restart_asking() || vendor_prompting() || mod_question_up()) {
+        restart_asking() || vendor_prompting() || mod_question_up() || ui::benchmark_menu::up()) {
         return;
     }
     switch (input) {

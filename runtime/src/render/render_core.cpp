@@ -564,6 +564,7 @@ void RenderCore::render_frame(bool present_swap_chain, bool black) {
     chunk.pointer_response=producer_pointer_response_;
     chunk.list = std::exchange(producer_list_, nullptr);
     if (chunk.list != nullptr) {
+        galaxy::bench::note_frame_list(chunk.list->item_count);
         const auto hold = device_gate_.hold();
         chunk.device_epoch = device_gate_.epoch();
         // Registries first: a table taken here names textures whose work is taken too.

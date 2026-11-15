@@ -138,6 +138,12 @@ target_link_libraries(galaxy_asset_store PUBLIC galaxy_runtime_abi)
 add_library(galaxy_save_files STATIC runtime/src/save_files.cpp)
 target_link_libraries(galaxy_save_files PUBLIC galaxy_runtime_abi galaxy_atomic_file)
 
+# Save import and export in the game (save_transfer.h): its zips, the Wii SD save's AES and the GameData.bin check are
+# BoringSSL's, zlib's inflate and the game's own SaveFileFormat.hpp.
+add_library(galaxy_save_transfer STATIC runtime/src/save_transfer.cpp)
+target_link_libraries(galaxy_save_transfer PUBLIC galaxy_runtime_abi galaxy_atomic_file nebula_bssl_crypto nebula_zinflate)
+target_include_directories(galaxy_save_transfer PRIVATE native/petari/include)
+
 # The host's extensions (host_extension.h, --extension).
 add_library(galaxy_host_extension STATIC runtime/src/host_extension.cpp runtime/src/luma_services_host.cpp)
 target_link_libraries(galaxy_host_extension PUBLIC galaxy_runtime_abi)
@@ -187,6 +193,7 @@ add_library(galaxy_native_host STATIC
     runtime/src/input/host_input.cpp
     runtime/src/input/controls_engine.cpp
     runtime/src/input/live_controls_engine.cpp
+    runtime/src/input/co_star.cpp
     runtime/src/input/key_positions_win32.cpp
     runtime/src/input/raw_mouse_win32.cpp
     runtime/src/input/rumble_route.cpp
@@ -222,13 +229,19 @@ add_library(galaxy_native_host STATIC
     runtime/src/mod_import.cpp
     runtime/src/vendor_download.cpp
     runtime/src/diag_report.cpp
+    runtime/src/strict_json.cpp
     runtime/src/diag_seal.cpp
     runtime/src/crash_report.cpp
     runtime/src/discord_presence.cpp
     runtime/src/controller_hid.cpp
     runtime/src/switch2_ble_win.cpp
     runtime/src/wiimote_hid.cpp
-    runtime/src/wiimote_link_win32.cpp)
+    runtime/src/wiimote_link_win32.cpp
+    # The home screen's update check (galaxy/update.h) over WinHTTP; Nebula Setup installs.
+    runtime/src/update/update.cpp
+    runtime/src/update/update_crypto.cpp
+    runtime/src/update/update_transport_winhttp.cpp
+    runtime/src/update/update_install_windows.cpp)
 target_link_libraries(galaxy_native_host
     PUBLIC
         galaxy_runtime_abi
@@ -251,7 +264,7 @@ target_link_libraries(galaxy_native_host
 )
 galaxy_host_options(galaxy_native_host)
 # The host's diagnostics report modes (diag_report.h).
-target_compile_definitions(galaxy_native_host PUBLIC NEBULA_DIAG_REPORTS=1)
+target_compile_definitions(galaxy_native_host PUBLIC NEBULA_DIAG_REPORTS=1 NEBULA_UPDATE_CHECK=1)
 
 # The same passes for the Vulkan renderer, compiled on the device (cmake/post_shader_sources.cmake).
 include(cmake/post_shader_sources.cmake)
@@ -422,11 +435,15 @@ add_library(galaxy_render STATIC
     "${galaxy_utility_shader_dir}/utility_shaders_dxbc.h"
     runtime/src/render/render_api.cpp
     runtime/src/render/render_config.cpp
+    runtime/src/render/renderer_choice.cpp
+    runtime/src/render/renderer_check_win32.cpp
 runtime/src/render/host_window_win32.cpp
     runtime/src/ui/native_settings.cpp
     runtime/src/ui/launcher.cpp
     runtime/src/ui/settings_model.cpp
     runtime/src/ui/settings_system_page.cpp
+    runtime/src/ui/settings_benchmark_page.cpp
+    runtime/src/ui/benchmark_menu.cpp
     runtime/src/ui/settings_advanced_page.cpp
     runtime/src/ui/settings_display_page.cpp
     runtime/src/ui/settings_general_page.cpp
@@ -439,6 +456,8 @@ runtime/src/render/host_window_win32.cpp
     runtime/src/render/galaxy_select.cpp
     runtime/src/benchmark_recommend.cpp
     runtime/src/benchmark.cpp
+    runtime/src/benchmark_stats.cpp
+    runtime/src/benchmark_results.cpp
     runtime/src/render/window_owner.cpp
     runtime/src/render/texture_store.cpp
     runtime/src/render/texture_pack.cpp
@@ -503,6 +522,9 @@ endif()
 # AMD FSR 3 (cmake/fidelityfx.cmake).
 include(cmake/fidelityfx.cmake)
 target_link_libraries(galaxy_render PRIVATE nebula_fidelityfx)
+# The renderer check reads the Vulkan headers in every Windows build (cmake/vulkan_headers.cmake).
+include(cmake/vulkan_headers.cmake)
+target_link_libraries(galaxy_render PRIVATE nebula_vulkan_headers)
 target_link_libraries(galaxy_render PUBLIC galaxy_asset_store)
 # Intel XeSS headers (MIT, third_party/xess): the runtime loads the signed library from a vendor folder at run time.
 target_include_directories(galaxy_render SYSTEM PRIVATE third_party/xess/include)
@@ -518,6 +540,7 @@ endif()
 target_link_libraries(galaxy_render PRIVATE mfplat mfreadwrite mfuuid d3d11)
 target_link_libraries(galaxy_render
     PUBLIC
+        galaxy_save_transfer
         galaxy_native_host
         galaxy_runtime_abi
         galaxy_runtime_settings
@@ -602,13 +625,14 @@ endfunction()
 
 set(rt runtime/src)
 galaxy_test(galaxy_atomic_file_tests SOURCES ${rt}/atomic_file_tests.cpp LIBS galaxy_atomic_file)
-# The update core of the Linux and macOS hosts (runtime/src/update), with a stand-in transport and platform.
+# The update core of the desktop hosts (runtime/src/update), with a stand-in transport and platform.
 galaxy_test(galaxy_update_tests SOURCES ${rt}/update/update.cpp ${rt}/update/update_crypto.cpp ${rt}/update/update_tests.cpp
     LIBS galaxy_atomic_file shell32 ARGS "${CMAKE_CURRENT_SOURCE_DIR}/installer/release-public-key.xml")
 galaxy_test(galaxy_save_files_tests SOURCES ${rt}/save_files_tests.cpp LIBS galaxy_save_files)
 galaxy_test(galaxy_save_format_tests SOURCES ${rt}/save_format_tests.cpp)
 galaxy_test(galaxy_launch_args_tests SOURCES ${rt}/launch_args_tests.cpp)
 target_include_directories(galaxy_save_format_tests PRIVATE native/petari/include)
+galaxy_test(galaxy_save_transfer_tests SOURCES ${rt}/save_transfer_tests.cpp LIBS galaxy_save_transfer)
 galaxy_test(galaxy_asset_store_tests SOURCES ${rt}/asset_store_tests.cpp ${rt}/luma_game_store.cpp LIBS galaxy_asset_store)
 target_include_directories(galaxy_asset_store_tests PRIVATE crates/nebula-import/include)
 # D-07: an older install's store and saves under the current layout.
@@ -676,9 +700,13 @@ endforeach()
 galaxy_test(galaxy_home_menu_model_tests SOURCES ${rt}/home_menu_model_tests.cpp)
 galaxy_test(galaxy_launcher_model_tests SOURCES ${rt}/ui/launcher_model_tests.cpp)
 galaxy_test(galaxy_resolution_fit_tests SOURCES ${rt}/render/resolution_fit_tests.cpp)
-galaxy_test(galaxy_benchmark_recommend_tests SOURCES ${rt}/benchmark_recommend_tests.cpp ${rt}/benchmark_recommend.cpp)
-galaxy_test(galaxy_diag_report_tests SOURCES ${rt}/diag_report_tests.cpp ${rt}/diag_report.cpp ${rt}/diag_seal.cpp
+galaxy_test(galaxy_benchmark_recommend_tests SOURCES ${rt}/benchmark_recommend_tests.cpp ${rt}/benchmark_recommend.cpp
+    ${rt}/strict_json.cpp)
+galaxy_test(galaxy_benchmark_stats_tests SOURCES ${rt}/benchmark_stats_tests.cpp ${rt}/benchmark_stats.cpp ${rt}/strict_json.cpp)
+galaxy_test(galaxy_diag_report_tests SOURCES ${rt}/diag_report_tests.cpp ${rt}/diag_report.cpp ${rt}/diag_seal.cpp ${rt}/strict_json.cpp
     LIBS nebula_archive nebula_bssl_crypto)
+target_compile_definitions(galaxy_diag_report_tests PRIVATE
+    NEBULA_BENCHMARK_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tools/telemetry/testdata/benchmark.json")
 
 galaxy_test(galaxy_settings_model_tests SOURCES ${rt}/ui/settings_model_tests.cpp ${rt}/ui/settings_model.cpp)
 
@@ -696,7 +724,13 @@ galaxy_test(galaxy_settings_display_page_tests SOURCES ${rt}/ui/settings_display
 galaxy_test(galaxy_settings_advanced_page_tests SOURCES ${rt}/ui/settings_advanced_page_tests.cpp
     ${rt}/ui/settings_advanced_page.cpp ${rt}/ui/settings_model.cpp runtime/src/render/galaxy_select.cpp)
 galaxy_test(galaxy_settings_system_page_tests SOURCES ${rt}/ui/settings_system_page_tests.cpp
-    ${rt}/ui/settings_system_page.cpp ${rt}/ui/settings_model.cpp)
+    ${rt}/ui/settings_system_page.cpp ${rt}/ui/settings_model.cpp ${rt}/render/renderer_choice.cpp)
+galaxy_test(galaxy_renderer_choice_tests SOURCES ${rt}/render/renderer_choice_tests.cpp ${rt}/render/renderer_choice.cpp)
+galaxy_test(galaxy_settings_benchmark_page_tests SOURCES ${rt}/ui/settings_benchmark_page_tests.cpp
+    ${rt}/ui/settings_benchmark_page.cpp ${rt}/benchmark_results.cpp ${rt}/benchmark_stats.cpp ${rt}/strict_json.cpp)
+if(WIN32)
+    target_link_libraries(galaxy_settings_benchmark_page_tests PRIVATE shell32)
+endif()
 galaxy_test(galaxy_discord_presence_tests SOURCES ${rt}/discord_presence_tests.cpp ${rt}/discord_presence.cpp)
 
 set(render_src runtime/src/render)
@@ -764,11 +798,15 @@ if(NEBULA_VULKAN)
     add_library(galaxy_render_vk STATIC
         runtime/src/render/render_api.cpp
             runtime/src/render/render_config.cpp
+            runtime/src/render/renderer_choice.cpp
+            runtime/src/render/renderer_check_win32.cpp
 runtime/src/render/host_window_win32.cpp
     runtime/src/ui/native_settings.cpp
     runtime/src/ui/launcher.cpp
     runtime/src/ui/settings_model.cpp
     runtime/src/ui/settings_system_page.cpp
+    runtime/src/ui/settings_benchmark_page.cpp
+    runtime/src/ui/benchmark_menu.cpp
     runtime/src/ui/settings_advanced_page.cpp
     runtime/src/ui/settings_display_page.cpp
     runtime/src/ui/settings_general_page.cpp
@@ -806,6 +844,8 @@ runtime/src/render/host_window_win32.cpp
         runtime/src/render/galaxy_select.cpp
         runtime/src/benchmark_recommend.cpp
         runtime/src/benchmark.cpp
+        runtime/src/benchmark_stats.cpp
+        runtime/src/benchmark_results.cpp
         runtime/src/render/frame_interpolation.cpp
         runtime/src/render/rt_materials.cpp
         runtime/src/render/rt_caps.cpp
@@ -871,6 +911,7 @@ runtime/src/render/host_window_win32.cpp
     target_link_libraries(galaxy_render_vk
         PUBLIC
             nebula_vulkan_deps
+            galaxy_save_transfer
             galaxy_native_host
             galaxy_runtime_abi
             galaxy_runtime_settings
@@ -917,10 +958,14 @@ if(NEBULA_D3D11)
     add_library(galaxy_render_d3d11 STATIC
         runtime/src/render/render_api.cpp
         runtime/src/render/render_config.cpp
+        runtime/src/render/renderer_choice.cpp
+        runtime/src/render/renderer_check_win32.cpp
         runtime/src/render/host_window_win32.cpp
         runtime/src/ui/native_settings.cpp
         runtime/src/ui/settings_model.cpp
         runtime/src/ui/settings_system_page.cpp
+        runtime/src/ui/settings_benchmark_page.cpp
+        runtime/src/ui/benchmark_menu.cpp
         runtime/src/ui/settings_advanced_page.cpp
         runtime/src/ui/settings_display_page.cpp
         runtime/src/ui/settings_general_page.cpp
@@ -958,6 +1003,8 @@ if(NEBULA_D3D11)
         runtime/src/render/galaxy_select.cpp
         runtime/src/benchmark_recommend.cpp
         runtime/src/benchmark.cpp
+        runtime/src/benchmark_stats.cpp
+        runtime/src/benchmark_results.cpp
         runtime/src/render/frame_interpolation.cpp
         runtime/src/render/rt_materials.cpp
         runtime/src/render/rt_caps.cpp
@@ -982,9 +1029,11 @@ if(NEBULA_D3D11)
     target_include_directories(galaxy_render_d3d11 SYSTEM PRIVATE third_party/xess/include "${GALAXY_STREAMLINE_SDK}/include")
     target_compile_features(galaxy_render_d3d11 PUBLIC cxx_std_20)
     target_compile_definitions(galaxy_render_d3d11 PUBLIC NEBULA_GPU_D3D11=1)
+    target_link_libraries(galaxy_render_d3d11 PRIVATE nebula_vulkan_headers)
     target_link_libraries(galaxy_render_d3d11
         PUBLIC
             galaxy_asset_store
+            galaxy_save_transfer
             galaxy_native_host
             galaxy_runtime_abi
             galaxy_runtime_settings

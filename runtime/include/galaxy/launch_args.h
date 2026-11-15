@@ -134,9 +134,10 @@ struct LaunchArgs {
     unsigned started_again = 0u;        // --started-again: starts this run made again before this one
     // --start-again-of <id>-<time> (Windows): the process this start takes over from, by its id and creation time.
     std::string start_again_of;
-    // --renderer d3d12|d3d11 (0: not given): the Direct3D 12 host runs NebulaD11 for d3d11 without starting Direct3D
-    // 12, and for d3d12 never falls back to it (host_main.cpp hand_off_to_d3d11). The Direct3D 11 host never hands back.
-    unsigned renderer = 0u;  // 1 d3d12, 2 d3d11
+    // --renderer d3d12|d3d11|vulkan (0: not given, the settings' renderer, render_config.h next_start_renderer): the
+    // Direct3D 12 host runs NebulaD11 for d3d11 and NebulaVk for vulkan without starting Direct3D 12 (host_main.cpp
+    // hand_off_to). A renderer given here never falls back to another when no card runs it.
+    unsigned renderer = 0u;  // 1 d3d12, 2 d3d11, 3 vulkan (render::RendererKind)
     std::vector<std::filesystem::path> extensions;  // --extension, each time given: host extensions (host_extension.h)
     // --import, each time given: mod files or folders imported as a drop on the window imports them, the result page
     // after. "Open with" and the .luma association start the game with it; a game already running for the
@@ -144,7 +145,8 @@ struct LaunchArgs {
     std::vector<std::filesystem::path> imports;
     bool safe_start = false;  // --safe-start 1: every mod off for this start, the player's choices kept
     // --shipped-mods: the folder of the .luma files that come with the game (mod_import.h install_shipped_mods); empty:
-    // <program folder>/luma/mods. Android's app gives the folder it unpacks them to.
+    // luma/mods in the package's folder (platform_paths.h package_directory). Android's app gives the folder it unpacks
+    // them to.
     std::filesystem::path shipped_mods;
     // --mod-dev, each time given: a mod in dev mode (reload.md 4; `lumalink run` passes it): its reload requests
     // (<mods>/.reload/<id>.request) are taken while the game runs.

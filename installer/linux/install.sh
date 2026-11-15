@@ -1,15 +1,14 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-only
-# Installs Nebula from this folder (installer/package-linux.sh made it).
+# Installs Nebula, or updates an installed copy.
 #
 #   ./install.sh [--disc <image>] [--portable <folder>] [--yes]
 #
-# --disc      your Super Mario Galaxy disc image (.iso, .rvz, .wbfs, ...). Asked for when not given; not needed again
-#             when updating an install that already has the game.
-# --portable  everything in this one folder (saves and settings in its data folder); nothing else on the PC changes.
-#             Without it, Nebula installs for this user: ~/.local/share/Nebula, a menu entry and .luma files opening
-#             in Nebula.
-# --yes       ask nothing: an install for this user unless --portable is given.
+# --disc      Your Super Mario Galaxy disc image (.iso, .rvz, .wbfs and others). Not needed when updating an
+#             install that already has the game.
+# --portable  Install into this folder. Saves and settings are kept in the folder.
+#             Without --portable, Nebula installs to ~/.local/share/Nebula and adds a menu entry.
+# --yes       Do not ask questions.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +22,7 @@ while [ $# -gt 0 ]; do
         --disc) disc=${2:?--disc needs a disc image}; shift 2 ;;
         --portable) portable=${2:?--portable needs a folder}; shift 2 ;;
         --yes) ask=0; shift ;;
-        -h | --help) sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h | --help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "install.sh: unknown option $1 (see ./install.sh --help)" >&2; exit 2 ;;
     esac
 done
@@ -48,8 +47,8 @@ say "Nebula $version"
 if [ -z "$portable" ] && [ "$ask" = 1 ]; then
     say ""
     say "How do you want to install Nebula?"
-    say "  1) For this user: a menu entry, saves in ~/.local/share/Nebula (recommended)"
-    say "  2) Portable: everything in one folder you choose, nothing else on this PC changes"
+    say "  1) Install (recommended)"
+    say "  2) Portable (choose a folder)"
     printf 'Choose 1 or 2 [1]: '
     read -r mode
     if [ "${mode:-1}" = 2 ]; then
@@ -79,7 +78,7 @@ have_game=0
 if [ -z "$disc" ] && [ "$have_game" = 0 ]; then
     [ "$ask" = 1 ] || fail "give your disc image with --disc <image>"
     say ""
-    say "Nebula needs your own copy of the game, once. Nothing of the disc image is changed or sent anywhere."
+    say "Choose your Super Mario Galaxy disc image."
     disc=$(choose_disc)
 fi
 if [ -n "$disc" ]; then
@@ -96,7 +95,7 @@ rm -rf "$target"
 mv "$target.new" "$target"
 chmod 755 "$target/nebula" "$target/nebula-import"
 if [ -n "$portable" ]; then
-    printf 'Nebula keeps its saves and settings in the data folder here. Keep this folder together: copy or move it whole.\n' > "$root/portable.txt"
+    printf 'Portable Nebula. Saves and settings are in the data folder.\n' > "$root/portable.txt"
 fi
 
 # The game, cooked from the disc image (the Windows Setup's import).

@@ -2,7 +2,9 @@
 // diag_report.h: the report's schema, the log tail's stripping, the one HTTPS POST and the host modes.
 #include "galaxy/diag_report.h"
 
+#include "galaxy/benchmark_stats.h"
 #include "galaxy/diag_endpoint.h"
+#include "galaxy/strict_json.h"
 #include "galaxy/platform_paths.h"
 
 #include <algorithm>
@@ -38,198 +40,11 @@
 namespace galaxy::diag {
 namespace {
 
-// ---- strict JSON (RFC 8259): one value, no duplicate keys, depth <= 12 ----
+// ---- strict JSON (strict_json.h) ----
 
-// An object's entry. Not std::pair<std::string, Value>: a pair may not be instantiated while Value is incomplete
-// (libstdc++ checks it inside Value's own definition), where a vector of a declared struct may.
-struct Member;
+using json::Value;
 
-struct Value {
-    enum Type { Null, Bool, Number, String, Array, Object } type = Null;
-    bool boolean = false;
-    double number = 0.0;
-    bool integer = false;  // no fraction, no exponent
-    std::string text;
-    std::vector<Value> items;
-    std::vector<Member> fields;
-
-    // Defined below, where Member is complete.
-    Value();
-    Value(const Value&);
-    Value(Value&&) noexcept;
-    Value& operator=(const Value&);
-    Value& operator=(Value&&) noexcept;
-    ~Value();
-};
-
-struct Member {
-    std::string first;
-    Value second;
-};
-
-Value::Value() = default;
-Value::Value(const Value&) = default;
-Value::Value(Value&&) noexcept = default;
-Value& Value::operator=(const Value&) = default;
-Value& Value::operator=(Value&&) noexcept = default;
-Value::~Value() = default;
-
-class Parser {
-public:
-    explicit Parser(std::string_view text) : s_(text) {}
-    bool parse(Value& out) {
-        if (!value(out, 0)) return false;
-        space();
-        return i_ == s_.size();
-    }
-
-private:
-    void space() {
-        while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) ++i_;
-    }
-    bool literal(std::string_view word) {
-        if (s_.substr(i_, word.size()) != word) return false;
-        i_ += word.size();
-        return true;
-    }
-    bool string(std::string& out) {
-        if (i_ >= s_.size() || s_[i_] != '"') return false;
-        ++i_;
-        while (i_ < s_.size()) {
-            const unsigned char c = static_cast<unsigned char>(s_[i_++]);
-            if (c == '"') return true;
-            if (c < 0x20u || c >= 0x7fu) return false;  // the schema's texts are printable ASCII
-            if (c != '\\') {
-                out.push_back(static_cast<char>(c));
-                continue;
-            }
-            if (i_ >= s_.size()) return false;
-            const char e = s_[i_++];
-            switch (e) {
-                case '"': out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case '/': out.push_back('/'); break;
-                case 'b': case 'f': case 'n': case 'r': case 't': return false;  // control characters
-                case 'u': {
-                    if (i_ + 4u > s_.size()) return false;
-                    unsigned code = 0;
-                    for (int k = 0; k < 4; ++k) {
-                        const char h = s_[i_++];
-                        code = code * 16u + (h >= '0' && h <= '9'   ? static_cast<unsigned>(h - '0')
-                                             : h >= 'a' && h <= 'f' ? static_cast<unsigned>(h - 'a' + 10)
-                                             : h >= 'A' && h <= 'F' ? static_cast<unsigned>(h - 'A' + 10)
-                                                                    : 0x10000u);
-                    }
-                    if (code < 0x20u || code >= 0x7fu) return false;
-                    out.push_back(static_cast<char>(code));
-                    break;
-                }
-                default: return false;
-            }
-        }
-        return false;
-    }
-    bool number(Value& out) {
-        const std::size_t start = i_;
-        if (i_ < s_.size() && s_[i_] == '-') ++i_;
-        if (i_ >= s_.size() || !std::isdigit(static_cast<unsigned char>(s_[i_]))) return false;
-        if (s_[i_] == '0') {
-            ++i_;
-        } else {
-            while (i_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[i_]))) ++i_;
-        }
-        bool integer = true;
-        if (i_ < s_.size() && s_[i_] == '.') {
-            integer = false;
-            ++i_;
-            if (i_ >= s_.size() || !std::isdigit(static_cast<unsigned char>(s_[i_]))) return false;
-            while (i_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[i_]))) ++i_;
-        }
-        if (i_ < s_.size() && (s_[i_] == 'e' || s_[i_] == 'E')) {
-            integer = false;
-            ++i_;
-            if (i_ < s_.size() && (s_[i_] == '+' || s_[i_] == '-')) ++i_;
-            if (i_ >= s_.size() || !std::isdigit(static_cast<unsigned char>(s_[i_]))) return false;
-            while (i_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[i_]))) ++i_;
-        }
-        if (i_ - start > 32u) return false;
-        const std::string digits(s_.substr(start, i_ - start));
-        out.type = Value::Number;
-        out.number = std::strtod(digits.c_str(), nullptr);
-        out.integer = integer;
-        return std::isfinite(out.number);
-    }
-    bool value(Value& out, int depth) {
-        if (depth > 12) return false;
-        space();
-        if (i_ >= s_.size()) return false;
-        const char c = s_[i_];
-        if (c == '{') {
-            ++i_;
-            out.type = Value::Object;
-            space();
-            if (i_ < s_.size() && s_[i_] == '}') {
-                ++i_;
-                return true;
-            }
-            for (;;) {
-                space();
-                std::string key;
-                if (!string(key)) return false;
-                for (const auto& field : out.fields) {
-                    if (field.first == key) return false;
-                }
-                space();
-                if (i_ >= s_.size() || s_[i_++] != ':') return false;
-                Value item;
-                if (!value(item, depth + 1)) return false;
-                out.fields.push_back(Member{std::move(key), std::move(item)});
-                space();
-                if (i_ < s_.size() && s_[i_] == ',') {
-                    ++i_;
-                    continue;
-                }
-                return i_ < s_.size() && s_[i_++] == '}';
-            }
-        }
-        if (c == '[') {
-            ++i_;
-            out.type = Value::Array;
-            space();
-            if (i_ < s_.size() && s_[i_] == ']') {
-                ++i_;
-                return true;
-            }
-            for (;;) {
-                Value item;
-                if (!value(item, depth + 1)) return false;
-                out.items.push_back(std::move(item));
-                space();
-                if (i_ < s_.size() && s_[i_] == ',') {
-                    ++i_;
-                    continue;
-                }
-                return i_ < s_.size() && s_[i_++] == ']';
-            }
-        }
-        if (c == '"') {
-            out.type = Value::String;
-            return string(out.text);
-        }
-        if (c == 't' || c == 'f') {
-            out.type = Value::Bool;
-            out.boolean = c == 't';
-            return literal(c == 't' ? "true" : "false");
-        }
-        if (c == 'n') return literal("null");
-        return number(out);
-    }
-
-    std::string_view s_;
-    std::size_t i_ = 0;
-};
-
-// ---- the schema: benchmark result schema 1 (benchmark.cpp write_result) ----
+// ---- the schema: the benchmark result (benchmark.cpp write_result, benchmark_recommend.h kResultSchema) ----
 
 using Rule = std::function<std::string(const Value&)>;
 struct Field {
@@ -317,63 +132,92 @@ std::vector<Field> with(std::vector<Field> a, const std::vector<Field>& b) {
 const Rule& benchmark_schema() {
     static const Rule schema = [] {
         const Rule n = nullable(number());
-        const Rule settings = object({{"internal_height", integer()}, {"upscaler", integer()}, {"msaa_samples", integer()},
-                                      {"ambient_occlusion", integer()}, {"ambient_occlusion_ssao", integer()},
-                                      {"enhanced_lighting", integer()}, {"per_pixel_lighting", integer()},
-                                      {"aa", integer()}, {"smaa_quality", integer()}, {"bloom", integer()},
-                                      {"vsync_interval", integer()}, {"max_fps", n}, {"frame_generation", integer()},
-                                      {"ray_tracing_enabled", integer()}, {"display_mode", integer()}});
-        const std::vector<Field> result = {
-            {"load_ms", n},
+        const Rule settings = object({{"internal_height", integer()}, {"aspect_mode", integer()}, {"upscaler", integer()},
+                                      {"msaa_samples", integer()}, {"aa", integer()}, {"smaa_quality", integer()},
+                                      {"ambient_occlusion", boolean()}, {"ambient_occlusion_ssao", boolean()},
+                                      {"enhanced_lighting", boolean()}, {"per_pixel_lighting", boolean()},
+                                      {"bloom", integer()}, {"vsync_interval", integer()}, {"max_fps", n},
+                                      {"frame_generation", integer()}, {"ray_tracing", boolean()},
+                                      {"display_mode", integer()}});
+        const Rule spread = nullable(object({{"average", n}, {"p99", n}, {"worst", n}}));
+        const Rule limiter = one_of({"gpu", "render thread", "game thread", "display", "waiting"});
+        // benchmark_stats.h: average FPS, the 1% and 0.1% lows, the frame-time percentiles and the stutters.
+        const std::vector<Field> frames = {
             {"frames", integer()},
-            {"pixels", n},
-            {"settings_held", boolean()},
-            {"interval_ms", object({{"p50", n}, {"p95", n}, {"p99", n}, {"worst", n}, {"over_16_7", integer()},
-                                    {"over_33_3", integer()}})},
-            {"gpu_ms", n},
-            {"gpu_pass_ms", names_to(n, 64)},
-            {"cpu_ms", object({{"game", n}, {"render", n}, {"audio", n}, {"process", n}})},
-            {"draws", nullable(integer())},
-            {"triangles", nullable(integer())},
-            {"gpu_memory_peak_mb", integer()},
-            {"process_peak_mb", integer()},
+            {"seconds", n},
+            {"average_fps", n},
+            {"low_1_fps", n},
+            {"low_01_fps", n},
+            {"frame_ms", object({{"average", n}, {"p50", n}, {"p95", n}, {"p99", n}, {"p999", n}, {"worst", n}})},
+            {"stutters", integer()},
         };
-        const Rule scene =
-            object(with({{"stage", text(64)}, {"scenario", integer()}, {"grand_stars", integer()}}, result));
-        const Rule probe_run = object(with({{"case", text(48)}}, result));
+        const Rule slow_frame = object({{"at_s", n}, {"ms", n}, {"gpu_ms", n}, {"render_ms", n}, {"game_ms", n},
+                                        {"cause", one_of({"pipeline built", "disc read", "texture made", "gpu",
+                                                          "render thread", "game thread", "waiting"})}});
+        const Rule scene = object(with(
+            {{"stage", text(64)},
+             {"scenario", integer()},
+             {"grand_stars", integer()},
+             {"settings_held", boolean()},
+             {"output", list(integer(), 2)},
+             {"output_moved", boolean()},
+             {"pixels", n},
+             {"load", object({{"ms", n}, {"read_mb", n}, {"pipelines", integer()}, {"textures", integer()}})},
+             {"limiter", limiter},
+             {"gpu_ms", spread},
+             {"gpu_passes", names_to(object({{"average", n}, {"p99", n}, {"share", n}}), 32)},
+             {"cpu_ms", object({{"game", spread}, {"render", spread}, {"audio", n}})},
+             {"work", object({{"draw_items", n}, {"texture_uploads", integer()}, {"texture_mb", n},
+                              {"pipelines_built", integer()}, {"read_mb", n}})},
+             {"gpu_memory_peak_mb", integer()},
+             {"process_peak_mb", integer()},
+             {"slowest_frames", list(slow_frame, 10)}},
+            frames));
+        const Rule run = object({
+            {"part", one_of({"yours", "standard"})},
+            {"measured_with", settings},
+            {"summary", object(with({{"limiter", limiter}, {"display_limited", boolean()}}, frames))},
+            {"scenes", list(scene, 16)},
+        });
+        const Rule probe_run = object({{"case", text(48)}, {"settings_held", boolean()}, {"pixels", n},
+                                       {"gpu_ms", spread}, {"average_fps", n}});
         return object({
             {"schema", [](const Value& v) {
-                 return v.type == Value::Number && v.integer && v.number == 1.0 ? std::string() : std::string("not 1");
+                 return v.type == Value::Number && v.integer && v.number == static_cast<double>(bench::kResultSchema)
+                            ? std::string()
+                            : std::string("not the benchmark's schema");
              }},
             {"app", object({{"version", text(48)}, {"commit", nullable(text(48))}})},
             {"created_utc", text(24)},
             {"status", one_of({"complete", "aborted", "failed"})},
             {"failure", text(96)},
-            {"backend", text(16)},
+            {"backend", one_of({"d3d12", "d3d11", "vulkan", "metal"})},
             {"device", object({{"gpu", text(96)}, {"vendor_id", integer()}, {"device_id", integer()},
-                               {"driver_version", nullable(text(48))}, {"api_level", nullable(text(48))},
-                               {"shared_memory", boolean()}, {"gpu_budget_mb", integer()}, {"cpu", text(96)},
-                               {"logical_cores", integer()}, {"ram_mb", integer()}, {"os", text(96)},
-                               {"output", list(integer(), 2)}, {"refresh_hz", n}})},
+                               {"driver_version", nullable(text(48))}, {"shared_memory", boolean()},
+                               {"gpu_budget_mb", integer()}, {"cpu", text(96)}, {"logical_cores", integer()},
+                               {"ram_mb", integer()}, {"os", text(96)}, {"output", list(integer(), 2)},
+                               {"refresh_hz", n}})},
             {"mods_loaded", boolean()},
             {"settings", settings},
-            {"measured_with", settings},
             {"limits", list(text(256), 8)},
-            {"scenes", list(scene, 16)},
+            {"runs", list(run, 2)},
             {"probe", object({{"stage", text(64)},
                               {"runs", list(probe_run, 16)},
                               {"fit", object({{"valid", boolean()}, {"fixed_ms", n}, {"ms_per_mpixel", n}})},
                               {"price_ms_per_mpixel", names_to(n, 16)}})},
-            {"thermal", nullable(object({{"stage", text(64)}, {"gpu_ms_first", n}, {"gpu_ms_last", n}, {"gpu_ratio", n},
-                                         {"p95_first", n}, {"p95_last", n}}))},
+            {"thermal", nullable(object({{"stage", text(64)}, {"judged", boolean()}, {"gpu_ms_first", n},
+                                         {"gpu_ms_last", n}, {"slowdown", n}, {"average_fps_first", n},
+                                         {"average_fps_last", n}}))},
             {"recommendation",
              nullable(object({{"budget_ms", n}, {"predicted_ms", n}, {"fits", boolean()}, {"cpu_bound", boolean()},
                               {"cpu_thread", nullable(text(16))}, {"height_left_out", boolean()},
                               {"settings", list(object({{"key", text(32)}, {"current", integer()},
                                                         {"recommended", integer()}}),
                                                 16)}}))},
-            {"summary", object({{"verdict", text(16)}, {"worst_stage", text(64)}, {"worst_gpu_ms", n},
-                                {"worst_p95_ms", n}})},
+            {"summary", object({{"verdict", one_of({"fits", "cpu_bound", "below_target", "none"})},
+                                {"average_fps", n}, {"low_1_fps", n}, {"spare_percent", n}, {"limiter", limiter},
+                                {"worst_stage", text(64)}, {"standard_average_fps", n},
+                                {"standard_low_1_fps", n}})},
         });
     }();
     return schema;
@@ -397,7 +241,7 @@ const Rule& report_schema() {
 std::string validate(std::string_view json, const Rule& schema, std::size_t max_size) {
     if (json.size() > max_size) return "too large";
     Value root;
-    if (!Parser(json).parse(root)) return "not strict JSON";
+    if (!json::parse(json, root)) return "not strict JSON";
     if (root.type != Value::Object) return "not an object";
     return schema(root);
 }
@@ -957,7 +801,7 @@ int run_command_line(int argc, char** argv) {
         const Key public_half = x25519_public(secret);
         const auto id = key_id(public_half);
         std::printf("public key: %s\nkey id: %s\n", hex(public_half.data(), 32u).c_str(), hex(id.data(), 8u).c_str());
-        std::printf("runtime/include/galaxy/diag_endpoint.h: kPublicKey[] = \"%s\";\n", hex(public_half.data(), 32u).c_str());
+        std::printf("runtime/include/galaxy/diag_endpoint_local.h: kPublicKey[] =\"%s\";\n", hex(public_half.data(), 32u).c_str());
         const std::u8string shown = file.u8string();
         std::printf("private key: %s\nKeep the private key offline and backed up; never commit or share it.\n",
                     reinterpret_cast<const char*>(shown.c_str()));
