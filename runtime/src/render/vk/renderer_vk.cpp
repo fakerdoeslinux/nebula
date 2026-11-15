@@ -3,6 +3,7 @@
 // copies and screen probes are renderer_vk_frame.cpp.
 
 #include "renderer_vk_internal.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/vk/streamline_vk.h"
 #if defined(_WIN32)
@@ -257,6 +258,13 @@ void RendererVk::report_adapter() {
     const bool rtx = properties.vendorID == 0x10DEu && std::strstr(properties.deviceName, "RTX") != nullptr;
     host_window::rtx_adapter.store(rtx, std::memory_order_relaxed);
     record_render_adapter(properties.deviceName, properties.vendorID, properties.deviceID, context.subsys_id(), false);
+    {
+        const vk::DeviceIdentity& identity = context.identity();
+        const vk::DriverVersion& v = identity.driver_version;
+        record_render_driver(!identity.driver_info.empty()
+                                 ? identity.driver_info
+                                 : std::to_string(v.major) + "." + std::to_string(v.minor) + "." + std::to_string(v.patch));
+    }
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = properties.vendorID;
     caps.adapter_device_id = properties.deviceID;
@@ -1808,8 +1816,8 @@ void RendererVk::shutdown() {
 }
 
 void RendererVk::grow_rings() {
-    // A ring whose frames took over half their budget (or spilled) grows; one whose last 600 frames stayed under a quarter of it
-    // gives half of its memory back.
+    // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames) stayed
+    // under a quarter of it gives half of its memory back (UploadRing::kQuietNs).
     // --diagnostics ring-stress: made again (at the size each wants) every kRingStressFrames frames.
     const bool ring_stress =
         ::galaxy::diagnosing(::galaxy::kDiagnoseRingStress) && frame_index_ % ::galaxy::kRingStressFrames == 0u;
@@ -1819,6 +1827,7 @@ void RendererVk::grow_rings() {
          !constant_ring_.wants_shrink() && !matrix_ring_.wants_shrink())) {
         return;
     }
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
     // No wait for the GPU: a ring is made again as a new buffer (the same size when only its segments change). The old buffer and its
     // chunks are released here, which hands them to the context to destroy once the work submitted so far has completed.
     const VkDevice device = vk::Context::get().device();
@@ -1886,6 +1895,7 @@ std::uint64_t RendererVk::completed_fence_value() const {
 }
 
 void RendererVk::wait_for_fence_value(std::uint64_t fence_value) {
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::FrameWait);
     if (fence_value == 0u) {
         throw std::runtime_error("invalid frame-specific GPU fence wait");
     }
@@ -1948,10 +1958,13 @@ void RendererVk::begin_frame() {
     }
     read_gpu_passes();
     prepare_gpu_pass_queries();
-    context.collect();
-    frame.retired.clear();
-    frame.retired_buffers.clear();
-    destroy_retired_pools(frame);
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::ResourceFree);
+        context.collect();
+        frame.retired.clear();
+        frame.retired_buffers.clear();
+        destroy_retired_pools(frame);
+    }
     trim_idle_effect_targets();
     if (frame_index_ % 120u == 0u) {
         sweep_target_slots();
@@ -2247,7 +2260,11 @@ void RendererVk::present_swapchain_image() {
         fg_hudless_ready_ = false;
     }
     vk::streamline_vk::mark_present_start();
-    const VkResult result = swapchain_calls_.present(context.queue(), &info);
+    VkResult result = VK_SUCCESS;
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Present);
+        result = swapchain_calls_.present(context.queue(), &info);
+    }
     vk::streamline_vk::mark_present_end();
     last_present_id_ = ids && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ? this_present_id : 0u;
     streamline_frame_open_ = false;
@@ -2568,6 +2585,7 @@ void RendererVk::read_gpu_passes() {
                 pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
             }
         }
+        galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
     }
     pass_mark_count_[frame_slot_] = 0u;
     std::array<std::uint64_t, 4> counts{};
@@ -2862,8 +2880,12 @@ bool RendererVk::present(const DisplayTexture* source, bool capture_backbuffer, 
     // A second at most: an image the presentation engine never returns (a surface going away) skips the frame.
     constexpr std::uint64_t kAcquireTimeoutNs = 1'000'000'000ull;
     const std::int64_t acquire_cpu = vk::thread_cpu_ns();
-    VkResult result = swapchain_calls_.acquire(context.device(), swapchain_.handle, kAcquireTimeoutNs, frame.acquired,
-                                            VK_NULL_HANDLE, &image);
+    VkResult result = VK_SUCCESS;
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Acquire);
+        result = swapchain_calls_.acquire(context.device(), swapchain_.handle, kAcquireTimeoutNs, frame.acquired, VK_NULL_HANDLE,
+                                          &image);
+    }
     vk::note_driver_cpu(vk::DriverCall::Acquire, vk::thread_cpu_ns() - acquire_cpu);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR || result == VK_TIMEOUT ||
         result == VK_NOT_READY) {

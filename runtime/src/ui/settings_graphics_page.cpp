@@ -55,7 +55,7 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
             [](RenderConfig& draft, int delta) {
                 const auto found = std::find(kInternalHeights.begin(), kInternalHeights.end(), normalized_internal_height(draft.internal_height));
                 draft.internal_height = kInternalHeights[settings_step(unsigned(found - kInternalHeights.begin()), unsigned(kInternalHeights.size()), delta)];
-            }, "3D PIXEL HEIGHT. WIDTH FOLLOWS ASPECT. MATCH DISPLAY FOLLOWS WINDOW SIZE AND FOLDING"});
+            }, "HEIGHT IN PIXELS THE GAME IS DRAWN AT. MATCH DISPLAY FOLLOWS THE SCREEN, ALSO WHEN THE WINDOW OR A FOLDING SCREEN CHANGES SIZE"});
     }
     if (state.dynamic_resolution_offered && render.upscaler == 0u) {
         rows.push_back({"DYNAMIC RESOLUTION", render.dynamic_resolution ? "ON" : "OFF",
@@ -355,7 +355,7 @@ std::vector<SettingsRow> graphics_page(const RenderConfig& render, const Graphic
                         draft.texture_packs = next != 0u;
                         draft.texture_pack_preload = next == 2u;
                     },
-                    "ON LOADS TEXTURES AS THEY APPEAR. PRELOAD LOADS THEM ALL AT ONCE"});
+                    "ON LOADS TEXTURES AS EACH STAGE LOADS. PRELOAD LOADS THEM ALL AT ONCE"});
     if (render.texture_packs) {
         const TexturePackSummary& packs = state.texture_packs;
         char value[32]{};

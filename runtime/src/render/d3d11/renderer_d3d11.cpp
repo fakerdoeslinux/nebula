@@ -5,6 +5,7 @@
 
 #include "galaxy/content_viewport.h"
 #include "galaxy/experimental_ultrawide_aspect.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/platform_time.h"
 #include "galaxy/render/host_window_win32.h"
@@ -225,7 +226,11 @@ void RendererD3D11::report_adapter() {
     const std::string& name = context.device_name();
     const unsigned vendor = context.caps().vendor;
     host_window::rtx_adapter.store(false, std::memory_order_relaxed);
-    record_render_adapter(name.c_str(), vendor, 0u, 0u, false);
+    DXGI_ADAPTER_DESC1 desc{};
+    IDXGIAdapter1* const adapter = context.adapter();
+    const bool described = adapter != nullptr && SUCCEEDED(adapter->GetDesc1(&desc));
+    record_render_adapter(name.c_str(), vendor, described ? desc.DeviceId : 0u, described ? desc.SubSysId : 0u, false);
+    record_render_driver(dxgi_driver_version(adapter));
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = vendor;
     std::snprintf(caps.adapter_description.data(), caps.adapter_description.size(), "%s", name.c_str());
@@ -409,14 +414,15 @@ void RendererD3D11::shutdown() {
 }
 
 void RendererD3D11::grow_rings() {
-    // A ring whose frames took over half their budget (or spilled) grows; one whose last 600 frames stayed under a
-    // quarter of it gives half of its memory back (renderer_mtl.mm grow_rings).
+    // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames)
+    // stayed under a quarter of it gives half of its memory back (UploadRing::kQuietNs; renderer_mtl.mm grow_rings).
     if (ring_growth_failed_ ||
         (!vertex_ring_.wants_growth() && !index_ring_.wants_growth() && !constant_ring_.wants_growth() &&
          !matrix_ring_.wants_growth() && !vertex_ring_.wants_shrink() && !index_ring_.wants_shrink() &&
          !constant_ring_.wants_shrink() && !matrix_ring_.wants_shrink())) {
         return;
     }
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
     // A ring is made again as new upload memory; the old memory goes with the frames that may still read it.
     gpu::Device* const device = this->device();
     std::vector<gpu::BufferRef> old;
@@ -483,6 +489,7 @@ std::uint64_t RendererD3D11::completed_fence_value() const {
 }
 
 void RendererD3D11::wait_for_fence_value(std::uint64_t fence_value) {
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::FrameWait);
     if (fence_value == 0u) {
         throw std::runtime_error("invalid frame-specific GPU fence wait");
     }
@@ -656,12 +663,18 @@ std::uint64_t RendererD3D11::end_frame(bool present_swap_chain, SubmissionCallba
                                     : presented_max_fps(cfg);
         pace_wait_ms = present_pacer_.pace(variable_refresh_ ? 0u : cfg.vsync_interval, paced_fps);
         // The display's own signal that a frame may be queued, awaited asleep and bounded (renderer_d3d12.cpp).
-        if (frame_latency_waitable_ != nullptr && vsync != 0u &&
-            WaitForSingleObjectEx(frame_latency_waitable_, 100u, TRUE) == WAIT_TIMEOUT && ++latency_timeouts_ <= 4u) {
-            std::cerr << "[present] the frame latency object did not signal within 100 ms\n";
+        if (frame_latency_waitable_ != nullptr && vsync != 0u) {
+            const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Acquire);
+            if (WaitForSingleObjectEx(frame_latency_waitable_, 100u, TRUE) == WAIT_TIMEOUT && ++latency_timeouts_ <= 4u) {
+                std::cerr << "[present] the frame latency object did not signal within 100 ms\n";
+            }
         }
         const std::int64_t start = galaxy::qpc_now();
-        const HRESULT hr = swap_chain_->Present(vsync, flags);
+        HRESULT hr = S_OK;
+        {
+            const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Present);
+            hr = swap_chain_->Present(vsync, flags);
+        }
         const std::int64_t end = galaxy::qpc_now();
         present_ms = static_cast<double>(end - start) * 1000.0 / static_cast<double>(galaxy::qpc_frequency());
         occluded_ = hr == DXGI_STATUS_OCCLUDED;
@@ -819,6 +832,7 @@ void RendererD3D11::read_pass_times(Frame& frame, UINT64 frequency, UINT64 frame
             pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
         }
     }
+    galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
 }
 
 std::size_t RendererD3D11::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {

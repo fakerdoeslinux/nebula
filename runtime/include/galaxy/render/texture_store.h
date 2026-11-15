@@ -139,6 +139,16 @@ public:
     // finished replacements and swaps them in; a new index or a changed dump mode looks every texture up again.
     void configure_texture_packs(const TexturePackSettings& settings);
     void apply_texture_packs();
+    // A loaded scene waits for the replacements of the textures it made (NEBULA_OPTION_SCENE_TEXTURES). Any thread: the
+    // texture operations queued so far (a count that only grows), those the render thread has applied, and the
+    // replacements of applied textures still loading or uploading.
+    [[nodiscard]] std::uint64_t queued_ops();
+    [[nodiscard]] std::uint64_t applied_ops() const noexcept { return applied_ops_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint32_t replacements_coming() const noexcept {
+        return replacements_coming_.load(std::memory_order_acquire);
+    }
+    // While a scene waits for them behind its loading screen: more of each frame goes to their uploads.
+    void set_replacements_hurried(bool hurried) noexcept { replacements_hurried_.store(hurried, std::memory_order_relaxed); }
     [[nodiscard]] TexturePacks::Stats texture_pack_stats() const noexcept { return packs_.stats(); }
 
     // The movie: `frame`'s planes as textures NEBULA_TEXTURE_MOVIE_Y, _U and _V until the next call; null: none.
@@ -295,6 +305,12 @@ private:
     std::vector<std::vector<TextureBackend::UploadChunk>> pack_staging_;
     std::uint64_t pack_named_ = 0u, pack_bound_ = 0u, pack_swapped_ = 0u, pack_stats_frame_ = 0u;
     std::uint64_t pack_apply_ns_ = 0u, pack_apply_max_ns_ = 0u;
+    std::uint64_t taken_ops_ = 0u;  // under lock_: the operations take_ops has handed out
+    std::atomic<std::uint64_t> applied_ops_{0u};
+    std::atomic<std::uint32_t> replacements_coming_{0u};
+    std::atomic<bool> replacements_hurried_{false};
+    void publish_replacements_coming();
+    std::uint32_t pack_slow_reported_ = 0u;  // frames over the replacements budget written to the log
 
     struct MoviePlane {
         gpu::TextureRef texture;

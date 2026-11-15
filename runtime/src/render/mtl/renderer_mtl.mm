@@ -445,8 +445,8 @@ void RendererMtl::shutdown() {
 }
 
 void RendererMtl::grow_rings() {
-    // A ring whose frames took over half their budget (or spilled) grows; one whose last 600 frames stayed under a
-    // quarter of it gives half of its memory back.
+    // A ring whose frames took over half their budget (or spilled) grows; one whose last 30 seconds (and 600 frames)
+    // stayed under a quarter of it gives half of its memory back (UploadRing::kQuietNs).
     if (ring_growth_failed_ ||
         (!vertex_ring_.wants_growth() && !index_ring_.wants_growth() && !constant_ring_.wants_growth() &&
          !matrix_ring_.wants_growth() && !vertex_ring_.wants_shrink() && !index_ring_.wants_shrink() &&
@@ -601,8 +601,10 @@ void RendererMtl::begin_frame() {
             }
             if (frame.pass_timed) {
                 // The slot's last frame by pass; the page's running average of each over the frames that ran it.
+                std::array<double, std::size(kPassTimeNames)> frame_ms{};
                 for (std::size_t pass = 0u; pass < frame.pass_time->size(); ++pass) {
                     const double ms = (*frame.pass_time)[pass].exchange(0.0, std::memory_order_acq_rel) * 1000.0;
+                    if (pass < frame_ms.size()) frame_ms[pass] = ms;
                     pass_window_ms_[pass] += ms;
                     if (ms > 0.0 && pass < pass_ema_ms_.size()) {
                         const float before = pass_ema_ms_[pass].load(std::memory_order_relaxed);
@@ -611,6 +613,8 @@ void RendererMtl::begin_frame() {
                                                  std::memory_order_relaxed);
                     }
                 }
+                galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(),
+                                              std::min(frame_ms.size(), frame.pass_time->size()));
                 ++pass_window_frames_;
             }
             stats_.gpu_ms += gpu_ms;

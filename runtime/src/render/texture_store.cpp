@@ -3,6 +3,7 @@
 #include "galaxy/windows_api.h"
 
 #include "galaxy/render/texture_store.h"
+#include "galaxy/benchmark.h"
 
 #include "galaxy/loss_report.h"
 #include "galaxy/render/block4_astc.h"
@@ -107,6 +108,7 @@ void detail::expand_record_level(std::uint8_t layout, const std::uint8_t* src, s
 
 struct TextureStore::Ops {
     std::vector<Op> list;
+    std::uint64_t serial = 0u;  // the operations handed out up to and with these (queued_ops)
 };
 
 bool TextureStore::samples_generated(const TextureSampler& mode, const TextureHandle& handle) {
@@ -386,6 +388,7 @@ bool TextureStore::stage_image(Op& op, const void* bytes, std::uint32_t size, st
 }
 
 std::uint32_t TextureStore::register_image(const NebulaTextureImage& image) {
+    galaxy::bench::note_texture(image.size);
     return gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Create;
@@ -408,6 +411,7 @@ void TextureStore::update_image(std::uint32_t id, const void* bytes, std::uint32
     if (id == 0u || is_target(id)) {
         return;
     }
+    galaxy::bench::note_texture(size);
     gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Update;
@@ -513,7 +517,23 @@ std::shared_ptr<TextureStore::Ops> TextureStore::take_ops() {
     if (queued_->list.empty()) {
         return nullptr;
     }
+    taken_ops_ += queued_->list.size();
+    queued_->serial = taken_ops_;
     return std::exchange(queued_, std::make_shared<Ops>());
+}
+
+std::uint64_t TextureStore::queued_ops() {
+    const std::lock_guard guard(lock_);
+    return taken_ops_ + queued_->list.size();
+}
+
+// The replacements on their way for textures that wait for them; published before the operations that asked for them.
+void TextureStore::publish_replacements_coming() {
+    std::uint32_t coming = 0u;
+    for (const auto& waiting : pack_waiters_) {
+        if (packs_.coming(waiting.first)) ++coming;
+    }
+    replacements_coming_.store(coming, std::memory_order_release);
 }
 
 void TextureStore::begin_frame(unsigned frame_slot, unsigned frames_in_flight) {
@@ -527,17 +547,23 @@ void TextureStore::begin_frame(unsigned frame_slot, unsigned frames_in_flight) {
         movie_staging_.resize(frames_in_flight);
     }
     ++frame_;
-    // The copy queue is done with what this slot's last frame sent it before its staging and retired textures go free.
-    backend_.begin_frame(frame_slot);
-    // The renderer has waited for this slot's fence: what it retired and read is idle.
-    for (Retired& retired : retired_[frame_slot]) {
-        evicting_bytes_ -= std::min(evicting_bytes_, retired.evicted_bytes);
-        if (retired.view != ~0u) {
-            backend_.release_view(retired.view);
-            free_srv_indices_.push_back(retired.view);
-        }
+    {
+        // The copy queue is done with what this slot's last frame sent it before its staging and retired textures go free.
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::UploadWait);
+        backend_.begin_frame(frame_slot);
     }
-    retired_[frame_slot].clear();
+    {
+        // The renderer has waited for this slot's fence: what it retired and read is idle.
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureFree);
+        for (Retired& retired : retired_[frame_slot]) {
+            evicting_bytes_ -= std::min(evicting_bytes_, retired.evicted_bytes);
+            if (retired.view != ~0u) {
+                backend_.release_view(retired.view);
+                free_srv_indices_.push_back(retired.view);
+            }
+        }
+        retired_[frame_slot].clear();
+    }
     frame_slot_ = frame_slot;
     for (ChunkRef& chunk : kept_[frame_slot]) {
         if (chunk.use_count() == 1 && chunk->size == kStagingChunkBytes) {
@@ -611,6 +637,10 @@ void TextureStore::apply_ops(Ops& ops, std::vector<std::uint32_t>& freed) {
         op.staged.chunk.reset();
     }
     ops.list.clear();
+    publish_replacements_coming();
+    if (ops.serial > applied_ops_.load(std::memory_order_relaxed)) {
+        applied_ops_.store(ops.serial, std::memory_order_release);
+    }
 }
 
 void TextureStore::apply_built_in(Op& op) {
@@ -625,9 +655,13 @@ void TextureStore::apply_built_in(Op& op) {
     if (op.staged.chunk != nullptr) {
         try {
             std::uint64_t bytes = 0u;
-            gpu::TextureRef texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, bytes,
-                                                              TexelFormat::Rgba8, true);
+            gpu::TextureRef texture;
+            {
+                const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureCreate);
+                texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, bytes, TexelFormat::Rgba8, true);
+            }
             if (texture) {
+                const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
                 backend_.record_upload(gpu::raw(texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
                                        op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
                 keep(op.staged.chunk);
@@ -649,7 +683,10 @@ void TextureStore::apply_built_in(Op& op) {
 
 void TextureStore::make_own(Entry& entry, const Op& op, bool once) {
     std::uint64_t allocation = 0u;
-    entry.texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, allocation, op.staged.format, once);
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureCreate);
+        entry.texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, allocation, op.staged.format, once);
+    }
     entry.bytes = allocation;
     // A whole texture is what the budget measures a reduced one against.
     entry.dropped = op.drop;
@@ -659,8 +696,11 @@ void TextureStore::make_own(Entry& entry, const Op& op, bool once) {
         // The record's levels, generated ones too: the budget leaves top levels out of those.
         entry.full_levels = std::max(op.full_levels, op.staged.levels);
     }
-    backend_.record_upload(gpu::raw(entry.texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
-                           op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
+        backend_.record_upload(gpu::raw(entry.texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
+                               op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+    }
     keep(op.staged.chunk);
     TextureHandle& own = entry.own;
     own.resource = gpu::raw(entry.texture);
@@ -705,8 +745,11 @@ void TextureStore::update_entry(Op& op) {
                       own.mip_levels == op.staged.levels && entry.name.format == op.name.format &&
                       !TextureBackend::direct_written(gpu::raw(entry.texture));
     if (same) {
-        backend_.record_upload(gpu::raw(entry.texture), true, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
-                               op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+        {
+            const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
+            backend_.record_upload(gpu::raw(entry.texture), true, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
+                                   op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+        }
         keep(op.staged.chunk);
         if (entry.name.hash == op.name.hash) {
             return;
@@ -1084,6 +1127,12 @@ void TextureStore::configure_texture_packs(const TexturePackSettings& settings) 
     if (!stager_set_) {
         // Before any load exists: the loader threads read it.
         packs_.set_stager([this](std::uint64_t size) { return backend_.create_upload_chunk(size); });
+        if constexpr (TextureBackend::kMakesAnywhere) {
+            packs_.set_maker([this](const TexturePackPixels& staged) {
+                const TextureBackend::Levels fill{&*staged.staging, 0u, staged.offsets.data(), staged.pitches.data()};
+                return backend_.make_texture(staged.width, staged.height, staged.level_count, TexelFormat::Rgba8, true, &fill);
+            });
+        }
         stager_set_ = true;
     }
     packs_.configure(settings);
@@ -1095,7 +1144,14 @@ void TextureStore::apply_texture_packs() {
         return;
     }
     const auto apply_start = std::chrono::steady_clock::now();
-    if (packs_.pump(pack_uploads_)) {
+    using Clock = std::chrono::steady_clock;
+    const auto ns_since = [](Clock::time_point from) {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - from).count());
+    };
+    std::uint64_t create_ns = 0u, record_ns = 0u, swap_ns = 0u;
+    std::uint32_t largest = 0u;
+    const bool hurried = replacements_hurried_.load(std::memory_order_relaxed);
+    if (packs_.pump(pack_uploads_, hurried ? TexturePacks::kUploadBytesHurried : TexturePacks::kUploadBytesPerFrame)) {
         // New index, packs turned off, or dumping toggled: every texture is looked up again.
         pack_waiters_.clear();
         for (std::uint32_t id = 0; id < entries_.size(); ++id) {
@@ -1105,11 +1161,13 @@ void TextureStore::apply_texture_packs() {
         }
     }
     // At most ~3 ms of uploads a frame (at least one); the rest wait, so a pack's first textures never stall a
-    // frame (a 2048x2048 level chain is 22 MB to stage).
-    constexpr auto kApplyBudget = std::chrono::microseconds(3000);
+    // frame (a 2048x2048 level chain is 22 MB to stage). While a loaded scene waits for them behind its loading
+    // screen, most of a frame.
+    const auto apply_budget = std::chrono::microseconds(hurried ? 12000 : 3000);
+    const std::uint64_t pump_ns = ns_since(apply_start);
     std::size_t done = 0;
     for (; done < pack_uploads_.size(); ++done) {
-        if (done != 0u && std::chrono::steady_clock::now() - apply_start > kApplyBudget) {
+        if (done != 0u && std::chrono::steady_clock::now() - apply_start > apply_budget) {
             break;
         }
         auto& [slot, pixels] = pack_uploads_[done];
@@ -1119,13 +1177,31 @@ void TextureStore::apply_texture_packs() {
         TextureReplacement replacement{};
         try {
             if (pixels.staging && pixels.level_count != 0u) {
-                // Staged by the loader: create and record the copy; the buffer lives until this slot comes round.
+                // Staged by the loader, its texture made there too (or here when it could not be): record the copy; the
+                // buffer lives until this slot comes round.
                 std::uint64_t allocation_bytes = 0;
-                gpu::TextureRef texture = backend_.create_texture(pixels.width, pixels.height, pixels.level_count, allocation_bytes,
-                                                                  TexelFormat::Rgba8, true);
+                largest = std::max({largest, pixels.width, pixels.height});
+                auto step = Clock::now();
+                gpu::TextureRef texture;
+                bool filled = false;
+                if (pixels.made) {
+                    backend_.adopt_texture(*pixels.made);
+                    allocation_bytes = pixels.made->allocation_bytes;
+                    filled = pixels.made->filled;
+                    texture = std::move(pixels.made->texture);
+                    pixels.made.reset();
+                } else {
+                    texture = backend_.create_texture(pixels.width, pixels.height, pixels.level_count, allocation_bytes,
+                                                      TexelFormat::Rgba8, true);
+                }
+                create_ns += ns_since(step);
                 if (texture) {
-                    backend_.record_upload(gpu::raw(texture), false, *pixels.staging, 0u, pixels.width, pixels.height,
-                                           pixels.level_count, pixels.offsets.data(), pixels.pitches.data());
+                    step = Clock::now();
+                    if (!filled) {
+                        backend_.record_upload(gpu::raw(texture), false, *pixels.staging, 0u, pixels.width, pixels.height,
+                                               pixels.level_count, pixels.offsets.data(), pixels.pitches.data());
+                    }
+                    record_ns += ns_since(step);
                     pack_staging_[frame_slot_].push_back(std::move(*pixels.staging));
                     pixels.staging.reset();
                     replacement.texture = std::move(texture);
@@ -1177,6 +1253,7 @@ void TextureStore::apply_texture_packs() {
             std::cerr << "[texture-pack] upload failed: " << error.what() << '\n';
             replacement = {};
         }
+        const auto swap_start = Clock::now();
         pixels = {};
         packs_.make_resident(slot, std::move(replacement));
         const auto waiting = pack_waiters_.find(slot);
@@ -1195,12 +1272,22 @@ void TextureStore::apply_texture_packs() {
             ++revision_;
         }
         pack_waiters_.erase(waiting);
+        swap_ns += ns_since(swap_start);
     }
     pack_uploads_.erase(pack_uploads_.begin(), pack_uploads_.begin() + static_cast<std::ptrdiff_t>(done));
+    publish_replacements_coming();
     const auto apply_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - apply_start).count());
     pack_apply_ns_ += apply_ns;
     pack_apply_max_ns_ = std::max(pack_apply_max_ns_, apply_ns);
+    if (!hurried && apply_ns > 4'000'000u && pack_slow_reported_ < 64u) {
+        ++pack_slow_reported_;
+        std::cerr << "[texture-pack] frame " << pack_stats_frame_ << ": " << static_cast<double>(apply_ns) / 1.0e6
+                  << " ms for " << done << " replacements (largest " << largest << "): find "
+                  << static_cast<double>(pump_ns) / 1.0e6 << ", create " << static_cast<double>(create_ns) / 1.0e6
+                  << ", copy " << static_cast<double>(record_ns) / 1.0e6 << ", swap "
+                  << static_cast<double>(swap_ns) / 1.0e6 << '\n';
+    }
     if (++pack_stats_frame_ % 600u == 0u && (packs_.enabled() || packs_.dumping())) {
         const TexturePacks::Stats stats = packs_.stats();
         std::cerr << "[texture-pack] names=" << stats.names << " named=" << pack_named_

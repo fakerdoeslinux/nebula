@@ -564,6 +564,7 @@ void RenderCore::render_frame(bool present_swap_chain, bool black) {
     chunk.pointer_response=producer_pointer_response_;
     chunk.list = std::exchange(producer_list_, nullptr);
     if (chunk.list != nullptr) {
+        galaxy::bench::note_frame_list(chunk.list->item_count);
         const auto hold = device_gate_.hold();
         chunk.device_epoch = device_gate_.epoch();
         // Registries first: a table taken here names textures whose work is taken too.
@@ -1638,9 +1639,9 @@ void RenderCore::render_loop() {
             const bool poll_probes = !probe_flights_.empty();
             // Draining for a stop, out of sight or behind another window: queued frames present without generated frames.
             interp_stopping_ = stop_render_thread_ || hidden || background;
-            // A native overlay over a game showing no interpolated frames (the HOME Menu's paused game draws no 3D scene;
-            // interpolation waits while the settings are open): the latest frame again at each display slot, so the
-            // overlay keeps the rate play had instead of the game's 60 Hz frame rate.
+            // A native overlay over a game showing no interpolated frames (the HOME Menu's paused game draws no 3D
+            // scene): the latest frame again at each display slot, so the overlay keeps the rate play had instead of the
+            // game's 60 Hz frame rate.
             overlay_idle = !hidden && !background && !stop_render_thread_ && overlay_idle_presents();
             if (!overlay_idle) {
                 overlay_idle_due_qpc_ = 0;
@@ -2466,7 +2467,7 @@ void RenderCore::render_frame_on_thread(FrameChunk& chunk) {
             shows = list.passes[p - 1u].kind == NEBULA_PASS_SHOW;
         }
     }
-    if (interp_on_ && shows && !interp_stopping_ && !native_settings_overlay_visible()) {
+    if (interp_on_ && shows && !interp_stopping_) {
         // It walks on the display's clock, after the frames between it and the list before.
         flush_waiting_list();
         interp_list_waiting_ = true;
