@@ -24,7 +24,7 @@ extern "C" {
 #define NEBULA_GAME_API __attribute__((visibility("default")))
 #endif
 
-#define NEBULA_GAME_API_VERSION 156u
+#define NEBULA_GAME_API_VERSION 157u
 
 /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
    display's rate; the host presents each or interpolates between them. */
@@ -625,7 +625,23 @@ enum {
                                                 recycle bin, 0: it is deleted. yes: APPLY, no: CLOSE */
     NEBULA_SETTINGS_STATUS_MOD_FORGET_ASK,   /* forget what a removed mod kept (its numbers and saved data)?
                                                 `status_text` its id. yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_ASK,    /* restart and run the benchmark? yes: APPLY, no: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS, /* the benchmark's results, a page at a time: `status_text` the page's
+                                                title, `long_text` its table (below), `status_number` the page from 0
+                                                << 8 | the page count; on the summary `picture` is the frame-time graph
+                                                (`graph_*`). next: APPLY, before: REVERT, back: CLOSE */
+    NEBULA_SETTINGS_STATUS_BENCHMARK_SEND_ASK, /* send the last result to the developer? yes: APPLY, see what is sent:
+                                                REVERT when `status_number` is 1 (the report opens in the system's text
+                                                viewer), no: CLOSE */
+    NEBULA_SETTINGS_STATUS_RENDERER_RESTART, /* the new renderer applies at the next start */
 };
+/* The benchmark's results table (NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS' `long_text`): lines split by '\n', cells by
+   '\t'. A cell starts with any of these, in this order: '*' the shown run's line (the menu's blue), '#' a heading (the
+   help's grey), '<' left aligned (column 0 always is), then '@' a stage, named in the game's own words, or '"' a name
+   shown as it is. Any other cell is the host's capitals, translated as the rows are (numbers kept). A cell followed by
+   an empty cell, or by the line's end before its group's last column, spans on over them, left aligned; it widens the
+   last column it covers only when it is wider than all it covers. A line of four cells whose third is left aligned is
+   two groups side by side (columns 0-1 and 2-3); a narrow window shows the second group's lines under the first's. */
 /* The Pair Joy-Con screen's halves (NEBULA_SETTINGS_STATUS_JOYCON). */
 enum {
     NEBULA_JOYCON_LEFT = 1,       /* a left half is connected */
@@ -683,7 +699,41 @@ typedef struct NebulaSettingsView {
     uint32_t picture_height;
     uint32_t help_as_is; /* 1: `help` is already in the played language (a mod's refusal, as the validator words it):
                             shown as is, not translated */
+    /* The benchmark's frame-time graph in `picture` (NEBULA_SETTINGS_STATUS_BENCHMARK_RESULTS' summary); 0 otherwise.
+       The plot inside the picture, in texels: frame time 0 at `graph_bottom`, `graph_top_ms` at `graph_top`. The
+       scale's lines are every `graph_step_ms`; the game writes their values, names the 60 and 30 FPS lines and numbers
+       the stages, each from its column in `graph_stage_starts` (`graph_stage_count` of them, the first at
+       `graph_left`). */
+    uint32_t graph_left;
+    uint32_t graph_top;
+    uint32_t graph_right;
+    uint32_t graph_bottom;
+    float graph_top_ms;
+    float graph_step_ms;
+    uint32_t graph_stage_count;
+    const uint32_t* graph_stage_starts;
 } NebulaSettingsView;
+
+/* What a benchmark step measures (NebulaBenchmarkState). */
+enum {
+    NEBULA_BENCHMARK_PART_YOURS = 0, /* the player's settings */
+    NEBULA_BENCHMARK_PART_STANDARD,  /* the standard settings (1920x1080, High), the same on every device */
+    NEBULA_BENCHMARK_PART_PROBE,     /* one optional pass, alone, to price it */
+    NEBULA_BENCHMARK_PART_AGAIN,     /* the first stage again, the device warmed up */
+};
+
+/* A benchmark run as the game's run panel shows it (benchmark_state). */
+typedef struct NebulaBenchmarkState {
+    uint32_t step;       /* the step running, from 1 */
+    uint32_t steps;      /* the run's steps */
+    uint32_t part;       /* NEBULA_BENCHMARK_PART_* */
+    uint32_t measuring;  /* 1 while the step's frames are measured; 0 while its stage loads or settles */
+    uint32_t fps_tenths; /* pictures shown a second over the last half second, in tenths; 0 not known */
+    uint32_t progress;   /* the whole run, 0 to 10000, never going back */
+    uint32_t stopping;   /* 1 once the player stopped it: the game starts again in a moment */
+    uint32_t input;      /* what the player last used, for the stop hint: NEBULA_SETTINGS_INPUT_* */
+    char stage[64];      /* the step's stage, the game's name for it (CosmosGardenGalaxy), NUL-ended */
+} NebulaBenchmarkState;
 
 /* The player's input to the settings menu (settings_input); the keyboard and controllers reach it through the host. */
 enum {
@@ -897,7 +947,8 @@ typedef struct NebulaHostServices {
     int (*galaxy_select_names_wanted)(void* user);
     /* A name for the galaxy select in the game's own words in the played language (UTF-16, NUL-terminated): galaxy
        `index`'s (`star` 0) or its star's. */
-    void (*galaxy_select_name)(void* user, uint32_t index, uint32_t star, const uint16_t* name);    /* `hd`: a texture record, the image handed over at `image` as the game painted it larger; the renderer draws it in
+    void (*galaxy_select_name)(void* user, uint32_t index, uint32_t star, const uint16_t* name);
+    /* `hd`: a texture record, the image handed over at `image` as the game painted it larger; the renderer draws it in
        that image's place while the image's texels are what they are now (a texture pack's name for them wins). NULL:
        what was handed over for `texture` goes. The renderer takes a copy. */
     void (*texture_hd)(void* user, uint32_t texture, const void* hd);
@@ -955,6 +1006,9 @@ typedef struct NebulaHostServices {
                              uint32_t error_capacity);
     /* The program freed, after the lists that name it are released. Game thread. */
     void (*post_free)(void* user, uint32_t program);
+    /* While a benchmark runs (Nebula --benchmark 1): `state` filled, 1; else 0 and nothing written. The game shows its
+       run panel from it; the host takes the stop (Escape, a controller's B, Android's back). Game thread. */
+    int32_t (*benchmark_state)(void* user, NebulaBenchmarkState* state);
 } NebulaHostServices;
 
 

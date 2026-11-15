@@ -1,5 +1,6 @@
 // RendererD3D12: device and swap chain, scene targets and copies, presentation.
 #include "galaxy/render/utility_shaders.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/renderer_d3d12.h"
 #include "galaxy/render/program_table.h"
@@ -15,6 +16,7 @@
 #include "galaxy/render/game_bloom_shape.h"
 #include "barriers_d3d12.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 #include "galaxy/render/rt/rt_backend.h"
 #include "galaxy/render/rt/rt_shaders.h"
 #include "galaxy/render/rt_caps.h"
@@ -1831,20 +1833,20 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             if (FAILED(made)) {
                 return false;
             }
-            // What no draw runs without: every texture and sampler in one unbounded table each, indexed by heap slot
-            // (create_draw_root_signature; tier 1 gives a stage 128 views and 16 samplers), and the programs' DXIL
-            // (shader model 6.0). An adapter without them is passed over, so the next one can be taken.
+            // What no draw runs without (d3d12_refusal: resource binding tier 2, shader model 6.0); the renderer check
+            // judges every card by the same rule. An adapter without it is passed over, so the next one can be taken.
+            D3D12Facts facts;
+            facts.device = true;
             D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            if (SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)))) {
+                facts.binding_tier = static_cast<unsigned>(options.ResourceBindingTier);
+            }
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
-            const bool bindless =
-                SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
-                options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
-            const bool dxil =
-                SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) &&
-                model.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
-            if (!bindless || !dxil) {
-                refused = narrow_utf8(description.Description) +
-                          (!bindless ? ": resource binding tier 1, tier 2 needed" : ": no shader model 6.0");
+            if (SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)))) {
+                facts.shader_model = static_cast<unsigned>(model.HighestShaderModel);
+            }
+            if (const RendererRefusal refusal = d3d12_refusal(facts); refusal != RendererRefusal::kNone) {
+                refused = narrow_utf8(description.Description) + ": " + refusal_reason(refusal);
                 std::cout << "[gpu] passed over " << refused << '\n';
                 return false;
             }
@@ -1875,7 +1877,10 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         };
         bool expect_rtx = false;
         {
+            // Every hardware adapter, in Windows' order, for the System page's GRAPHICS CARD choice.
+            std::vector<GpuChoice> choices;
             bool first = true;
+            bool settled = false;
             for (UINT index = 0u;; ++index) {
                 ComPtr<IDXGIAdapter1> candidate;
                 DXGI_ADAPTER_DESC1 description{};
@@ -1885,16 +1890,18 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
                 if (FAILED(candidate->GetDesc1(&description)) || (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) {
                     continue;
                 }
-                const bool chosen = !chosen_gpu.empty() &&
-                                    gpu_identity(description.VendorId, description.DeviceId, description.SubSysId) == chosen_gpu;
-                if (chosen || first) {
+                const std::string identity = gpu_identity(description.VendorId, description.DeviceId, description.SubSysId);
+                std::array<char, 128> name{};
+                copy_adapter_description(description, name);
+                choices.push_back(GpuChoice{identity, name.data()});
+                const bool chosen = !chosen_gpu.empty() && identity == chosen_gpu;
+                if (!settled && (chosen || first)) {
                     expect_rtx = rtx(description);
                 }
                 first = false;
-                if (chosen) {
-                    break;
-                }
+                settled = settled || chosen;
             }
+            record_gpu_choices(std::move(choices));
         }
         const bool frame_generation = get_render_config().frame_generation != 0u;
         std::thread streamline_start;
@@ -1955,6 +1962,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             streamline_start.join();
         }
         if (!adapter || !device_) {
+            if (!same_card_only_) note_no_device();
             throw std::runtime_error(refused.empty() ? std::string("No hardware D3D12 adapter supports feature level 11_0")
                                                      : "No hardware D3D12 adapter can run the renderer (" + refused + ")");
         }
@@ -2114,6 +2122,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             copy_adapter_description(adapter_desc, description);
             record_render_adapter(description.data(), adapter_desc.VendorId, adapter_desc.DeviceId,
                                   adapter_desc.SubSysId, offered);
+            record_render_driver(dxgi_driver_version(adapter.Get()));
         }
         RenderFeatureCaps caps{};
         caps.d3d12_device_created = true;
@@ -3540,6 +3549,7 @@ void RendererD3D12::begin_frame() {
                     pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
                 }
             }
+            galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
             const D3D12_RANGE no_write{0, 0};
             pass_readback_->Unmap(0, &no_write);
         }

@@ -20,7 +20,7 @@ namespace {
     };
     // The host's view (NEBULA_HOME_MENU_LAUNCHER_OPEN): bit 16 marks the home screen's, bits 8-15 its page.
     const s32 cLauncherView = 1 << 16;
-    enum { cChoicePlay = 0, cChoiceQuit = 1, cChoiceBenchmark = 2 };
+    enum { cChoicePlay = 0, cChoiceQuit = 1, cChoiceBenchmark = 2, cChoiceUpdate = 3 };
 
     bool sHolding = false;
     bool sLeaving = false;
@@ -64,6 +64,7 @@ namespace NebulaLauncher {
             sHolding = false;
             break;
         case cChoiceQuit:
+        case cChoiceUpdate:       // the host starts Nebula Setup to install it when the game has left
         case cChoiceBenchmark: {  // the host starts again into the benchmark when the game has left
             play(cSoundGotoMenu);
             sLeaving = true;

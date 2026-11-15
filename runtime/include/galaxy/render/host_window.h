@@ -92,8 +92,9 @@ void set_state_wake(void* event) noexcept;
 void native_settings_present();
 // Opens the settings menu on that page (a tab's number), its first row chosen.
 void open_native_settings(unsigned page);
-// The same, with `draft` as its unapplied settings (kept inside what the display allows): Apply keeps them.
-void open_native_settings_draft(unsigned page, const RenderConfig& draft);
+// The settings menu on SYSTEM with the benchmark's results window for `result` (a result file, or the results folder
+// for its newest): the start after a benchmark.
+void open_native_settings_results(const std::filesystem::path& result);
 
 // What the settings menu (runtime/src/ui/native_settings.cpp) asks of its platform.
 struct SettingsMonitor {
@@ -108,10 +109,14 @@ struct SettingsMonitor {
 [[nodiscard]] bool window_modal_active() noexcept;
 // The window's inside to that size in pixels, from any thread (an extension's resize_window).
 void resize_window_client(unsigned width, unsigned height) noexcept;
-enum class FilePick { Miis, ModArchives, ModFolders };
+enum class FilePick { Miis, ModArchives, ModFolders, Saves };
 // The platform's file picker; `done` runs off the window's thread with what was chosen. Android picks documents
-// (no folders: ModFolders is not offered there) and hands over copies the game can read by path.
+// (no folders: ModFolders is not offered there) and hands over copies the game can read by path. Saves picks one file.
 void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::path>)> done);
+// The platform's save dialog for a file the game made (an export): the player chooses where it goes, under `file`'s
+// name, and it is copied there. `done` runs off the window's thread.
+enum class SaveCopy { Saved, Cancelled, Failed };
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done);
 // Shows a folder of the game's in the platform's file manager; folders_open is false where none can (Android: the
 // app's own storage is private to it).
 void open_folder(const std::filesystem::path& folder);
@@ -122,7 +127,6 @@ struct UpscalerCaps {
 };
 [[nodiscard]] UpscalerCaps upscaler_caps() noexcept;
 [[nodiscard]] unsigned dlss_min_width(unsigned quality, unsigned width, unsigned height) noexcept;
-[[nodiscard]] bool launcher_available();
 [[nodiscard]] bool dlss_files_present();
 [[nodiscard]] bool xess_files_present();
 [[nodiscard]] bool frame_generation_files_present();
@@ -137,7 +141,22 @@ enum class VendorInstall { Running, Done, Canceled, Failed };
 void fetch_vendor_license(unsigned upscaler);
 enum class VendorLicense { Loading, Ready, Failed };
 [[nodiscard]] VendorLicense vendor_license(std::string& text);
-[[nodiscard]] bool restart_game(bool record);
+// What a start-again starts: the game as usual, a diagnostics run (--diagnostics 1), the benchmark (--benchmark 1
+// --benchmark-return 1), or the start after the benchmark, its result open (--benchmark-result).
+enum class Restart : int { Start = 1, Diagnostics = 2, Benchmark = 3, Results = 4 };
+// Ends the game as Quit does and starts it again once it has closed; false where this host cannot (can_restart).
+[[nodiscard]] bool restart_game(Restart kind);
+// The start-again restart_game asked for, read by the host as the game ends: 0 none, else a Restart's value.
+[[nodiscard]] int restart_wanted() noexcept;
+// This host can start the game again (not iOS, where an app cannot start itself).
+[[nodiscard]] bool can_restart() noexcept;
+#if defined(__ANDROID__)
+// The activity starts the game again in a new process (GameActivity.restartGame) and ends this one: the host's last
+// step (host_main finish_and_exit), once the saves are written.
+void start_again(Restart kind);
+#endif
+// Ends the game as the window's close does (the settings' Update on Windows, once Nebula Setup has started).
+void quit_game() noexcept;
 
 extern std::atomic<bool> ray_tracing_offered;  // the RAY TRACING row is offered
 extern std::atomic<bool> rtx_adapter;          // the session's GPU is an NVIDIA RTX (DLSS)

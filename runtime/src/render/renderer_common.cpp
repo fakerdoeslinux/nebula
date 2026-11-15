@@ -2,10 +2,12 @@
 // What both renderers share (renderer_common.h).
 
 #include "galaxy/render/renderer_common.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/platform_time.h"
 
 #if defined(_WIN32)
 #include "galaxy/windows_api.h"
+#include <dxgi.h>
 #else
 #include <sched.h>
 #include <time.h>
@@ -284,9 +286,10 @@ double PresentPacer::pace(unsigned vsync_interval, float max_fps) {
     // smooths the handoff to DXGI when a frame edge arrives a little early; the cap
     // keeps it from throttling the producer or hiding missing pictures behind
     // duplicated presents.
+    // A benchmark's measured window presents each picture as soon as it is drawn (benchmark.h).
     if (vsync_interval != 0u ||
         max_fps <= 0.0f ||
-        frequency_ <= 0) {
+        frequency_ <= 0 || galaxy::bench::unpaced()) {
         last_qpc_ = 0;
         return 0.0;
     }
@@ -337,6 +340,19 @@ std::condition_variable g_picture_files_done;
 std::size_t g_picture_files_open = 0u;
 
 }  // namespace
+
+#if defined(_WIN32)
+std::string dxgi_driver_version(IDXGIAdapter* adapter) {
+    LARGE_INTEGER umd{};
+    if (adapter == nullptr || FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+        return {};
+    }
+    const auto high = static_cast<unsigned long>(umd.HighPart);
+    const auto low = static_cast<unsigned long>(umd.LowPart);
+    return std::to_string(high >> 16u) + "." + std::to_string(high & 0xffffu) + "." + std::to_string(low >> 16u) + "." +
+           std::to_string(low & 0xffffu);
+}
+#endif
 
 void write_ppm_async(std::string path, std::vector<std::uint8_t> rgb, unsigned width, unsigned height) {
     {

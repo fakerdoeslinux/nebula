@@ -16,3 +16,11 @@ namespace NebulaSettingsMenu {
     // (at most `capacity` units with the terminator); its length. The mod log's host sentences (LumaModLog).
     s32 translateHost(char16_t* pDst, s32 capacity, const char* pText);
 };  // namespace NebulaSettingsMenu
+
+// The benchmark's run panel at the screen's top left while a run measures (NebulaHostServices::benchmark_state): the
+// stage, the frame rate, the step, the run's progress and how to stop it.
+namespace NebulaBenchmarkPanel {
+    void init();    // GameSystem::initAfterSystemArchiveLoaded
+    void update();  // GameSystem::update, once a frame
+    void draw();    // GameSystem::draw, over the game's screens
+};  // namespace NebulaBenchmarkPanel

@@ -41,7 +41,7 @@ A set turns on several recordings at once.
 | Set | Recordings |
 |---|---|
 | `0` | None |
-| `1` | `timeline`, `frame-tails`, `pointer-latency`, `present-stats` and `gpu-passes`. This is what the launcher's diagnostics option records. |
+| `1` | `timeline`, `frame-tails`, `pointer-latency`, `present-stats` and `gpu-passes`. This is what **Record** on the **SYSTEM** page of the settings records. |
 | `frames` | `timeline`, `frame-tails`, `pointer-latency`, `present-stats` and `frame-times` |
 | `gpu` | `gpu-passes` |
 | `loads` | `scene-loads` and `file-reads` |

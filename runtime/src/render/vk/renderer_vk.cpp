@@ -3,6 +3,7 @@
 // copies and screen probes are renderer_vk_frame.cpp.
 
 #include "renderer_vk_internal.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/vk/streamline_vk.h"
 #if defined(_WIN32)
@@ -257,6 +258,13 @@ void RendererVk::report_adapter() {
     const bool rtx = properties.vendorID == 0x10DEu && std::strstr(properties.deviceName, "RTX") != nullptr;
     host_window::rtx_adapter.store(rtx, std::memory_order_relaxed);
     record_render_adapter(properties.deviceName, properties.vendorID, properties.deviceID, context.subsys_id(), false);
+    {
+        const vk::DeviceIdentity& identity = context.identity();
+        const vk::DriverVersion& v = identity.driver_version;
+        record_render_driver(!identity.driver_info.empty()
+                                 ? identity.driver_info
+                                 : std::to_string(v.major) + "." + std::to_string(v.minor) + "." + std::to_string(v.patch));
+    }
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = properties.vendorID;
     caps.adapter_device_id = properties.deviceID;
@@ -2568,6 +2576,7 @@ void RendererVk::read_gpu_passes() {
                 pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
             }
         }
+        galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
     }
     pass_mark_count_[frame_slot_] = 0u;
     std::array<std::uint64_t, 4> counts{};
