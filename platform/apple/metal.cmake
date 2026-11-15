@@ -59,6 +59,12 @@ target_include_directories(galaxy_render_mtl PUBLIC "${nebula_root}/runtime/src"
 target_include_directories(galaxy_render_mtl PRIVATE "${nebula_root}/third_party/smaa" "${nebula_root}/native/include"
     "${nebula_apple_utility_msl_dir}")
 target_link_libraries(galaxy_render_mtl PRIVATE nebula_msl)
+# As platform/sdl gives galaxy_render_vk: TLS and gzip for the net services (luma_net.cpp), the save import's AES,
+# hashes and inflate (save_transfer.cpp), and the game's GameData.bin check (a source property is its folder's, so
+# platform/sdl's does not reach this folder's target).
+target_link_libraries(galaxy_render_mtl PRIVATE nebula_bssl_ssl nebula_zinflate)
+set_property(SOURCE "${nebula_root}/runtime/src/save_transfer.cpp" APPEND PROPERTY INCLUDE_DIRECTORIES
+    "${nebula_root}/native/petari/include")
 target_link_libraries(galaxy_render_mtl PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation"
     "-framework CoreGraphics" "-framework IOSurface")
 # MetalFX is asked for at run time (macOS 13, iOS 16): the program starts without it.

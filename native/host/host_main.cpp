@@ -102,9 +102,9 @@
 #include "galaxy/ui/launcher_model.h"
 #if defined(NEBULA_UPDATE_CHECK)
 #include "galaxy/update.h"
+#endif
+#endif
 #include "galaxy/save_transfer.h"
-#endif
-#endif
 #include <nebula_frame_list.h>
 #include "galaxy/render/rt_materials.h"
 #include "galaxy/render/rt_caps.h"
