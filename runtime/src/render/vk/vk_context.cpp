@@ -451,7 +451,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         }
     }
 
-    // The GPU chosen in Nebula Settings, else the first discrete device; each needs a graphics queue
+    // The GPU chosen on the System page, else the first discrete device; each needs a graphics queue
     // (that presents to the surface) and the swapchain extension.
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(instance_, &count, nullptr);
@@ -482,6 +482,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
 #endif
         std::vector<std::pair<Rank, VkPhysicalDevice>> ranked;
         ranked.reserve(devices.size());
+        std::vector<GpuChoice> choices;  // every GPU but a software renderer, for the System page's GRAPHICS CARD choice
         for (const VkPhysicalDevice device : devices) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(device, &properties);
@@ -495,6 +496,9 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
             }
             const Adapter adapter = adapter_of(device);
             const bool chosen = !chosen_gpu.empty() && adapter.identity == chosen_gpu;
+            if (properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                choices.push_back(GpuChoice{adapter.identity, properties.deviceName});
+            }
             std::uint64_t place = ~std::uint64_t{0};
 #if defined(_WIN32)
             for (std::size_t i = 0; i < windows_order.size() && adapter.luid != 0u; ++i) {
@@ -515,6 +519,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         for (std::size_t i = 0; i < ranked.size(); ++i) {
             devices[i] = ranked[i].second;
         }
+        record_gpu_choices(std::move(choices));
     }
     bool vulkan_1_0_only = false;
     for (const VkPhysicalDevice candidate : devices) {

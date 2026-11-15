@@ -40,8 +40,9 @@ void launcher_point(unsigned answer) noexcept;
 void launcher_choose(unsigned answer) noexcept;
 // A key while the settings menu is closed; `accept` a controller's A. True when the home screen took it.
 [[nodiscard]] bool launcher_key(std::uintptr_t key, bool was_down, bool accept) noexcept;
-// An update was found (any thread): its version and notes (UTF-8) for the notice's page.
-void launcher_offer_update(std::string_view version, std::string_view notes);
+// An update was found (any thread): its version and notes (UTF-8) for the notice's page; `installs`: this install updates
+// itself (the page's Update, LauncherModel::kChoiceUpdate), else the page only tells.
+void launcher_offer_update(std::string_view version, std::string_view notes, bool installs);
 // The notice's texts for the game: `which` 0 the version, 1 the notes; the UTF-16 unit at `index`, 0 past the end.
 [[nodiscard]] unsigned launcher_text(unsigned which, unsigned index) noexcept;
 

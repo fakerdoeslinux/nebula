@@ -192,13 +192,13 @@ bool launcher_key(std::uintptr_t key, bool was_down, bool accept) noexcept {
     return true;
 }
 
-void launcher_offer_update(std::string_view version, std::string_view notes) {
+void launcher_offer_update(std::string_view version, std::string_view notes, bool installs) {
     {
         const std::lock_guard<std::mutex> lock(s_text_mutex);
         s_version = utf16_of(version, kVersionUnits, 1u);
         s_notes = utf16_of(notes, kNotesUnits, kNotesLines);
     }
-    s_model.offer_notice();
+    s_model.offer_notice(installs);
 }
 
 unsigned launcher_text(unsigned which, unsigned index) noexcept {

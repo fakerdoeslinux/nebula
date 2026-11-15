@@ -46,7 +46,7 @@ data class BenchmarkResult(
         var current = true
         var applied = true
         // With enhanced lighting or ray tracing on, the engine lights at the pixel whatever per_pixel_lighting holds
-        // (render_config.h lights_at_pixel): it is not compared then, as on the Windows launcher, whose settings window
+        // (render_config.h lights_at_pixel): it is not compared then, as in the game's own settings, whose GRAPHICS page
         // writes it from the Lighting row. A run with either key different already fails on that key.
         val perPixelInert = Benchmark.configValue(config, "enhanced_lighting") == 1.0 ||
             Benchmark.configValue(config, "ray_tracing_enabled") == 1.0

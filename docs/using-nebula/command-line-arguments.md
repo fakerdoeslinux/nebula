@@ -9,7 +9,7 @@ contentType: reference
 
 Every Nebula executable takes the same arguments: `Nebula.exe` (Direct3D 12), `NebulaD11.exe` (Direct3D 11), `NebulaVk.exe` (Vulkan) and the SDL builds for Linux and macOS. Each argument is a name followed by a value.
 
-The launcher passes `--pak` and `--saves` for you. The Android app also passes `--data` and `--module`.
+The Start menu shortcut on Windows and `nebula-launch` on Linux pass `--pak` and `--saves` for you. The Android app also passes `--data` and `--module`.
 
 ## Files and folders
 
@@ -28,7 +28,7 @@ The launcher passes `--pak` and `--saves` for you. The Android app also passes `
 | Argument | Value |
 |---|---|
 | `--renderer d3d12` or `--renderer d3d11` | Windows, `Nebula.exe` only. `d3d11` runs `NebulaD11.exe` (the build for the same CPU level) in its place, without starting Direct3D 12. `d3d12` never falls back. Without this argument, Direct3D 11 runs when no graphics adapter can run Direct3D 12. |
-| `--home 1` or `--home 0` | `1` shows the home screen (**Play**, **Settings**, **Benchmark**, **Quit** and an update notice) before the title screen. `0` goes straight into the game. The default is `1` on macOS and Linux, and `0` on Windows and Android, where the launcher is the home screen. A hidden start and a start with `--seconds` also default to `0`. |
+| `--home 1` or `--home 0` | `1` shows the home screen (**Play**, **Settings**, **Benchmark**, **Quit** and an update notice) before the title screen. `0` goes straight into the game. The default is `1`, except on Android, where the app has its own home screen. A hidden start and a start with `--seconds` also default to `0`. |
 | `--safe-start 1` | Turns every mod off for this start only. Your choices on the **Mods** page stay as they are for the next start. Holding <kbd>Shift</kbd> while Nebula starts does the same. |
 | `--seconds N` | Ends the game after N seconds. |
 | `--hidden 1` | Linux and macOS. Starts without a window and never reads your keyboard, mouse or controllers. Test tools use it. On Windows, a start with a hidden window does the same. |
@@ -44,7 +44,7 @@ After a crash with mods turned on, the next start is a safe start. If only mod c
 | Argument | Value |
 |---|---|
 | `--import FILE-OR-FOLDER` | Imports a mod the same way as dropping it on the window, then shows the result: the validator's findings. Nothing is added when the validator finds an error. Repeat the argument for each mod. **Open with** and the `.luma` file type use this argument. If Nebula is already running with the same settings folder, the running game takes the files and comes to the front. |
-| `--import-mod FOLDER-OR-ARCHIVE` | Imports one or more mods into the `mods` folder of the settings folder. The validator checks each package first, and nothing is added when it finds an error. Prints the result as JSON: for each mod, `checked`, `refused` and `findings` (each with `code`, `error`, `file` and `text`). The launcher's **Mods** page uses this argument. |
+| `--import-mod FOLDER-OR-ARCHIVE` | Imports one or more mods into the `mods` folder of the settings folder. The validator checks each package first, and nothing is added when it finds an error. Prints the result as JSON: for each mod, `checked`, `refused` and `findings` (each with `code`, `error`, `file` and `text`). |
 | `--remove-mod MOD-ID` | Removes an imported mod. Replace MOD-ID with the mod's `id` from its `luma.json`. |
 | `--list-mods` | Prints the imported mods as JSON. |
 
@@ -52,7 +52,7 @@ After a crash with mods turned on, the next start is a safe start. If only mod c
 
 | Argument | Value |
 |---|---|
-| `--diagnostics WHAT` | What this run records, in the log and in the `diagnostics` folder of the data folder. Separate several values with commas. `1` records what the launcher's diagnostics option records: the frame timeline, the frame and pointer monitors, present statistics, and GPU time for each pass. For more information, see [Diagnostics](diagnostics.md). |
+| `--diagnostics WHAT` | What this run records, in the log and in the `diagnostics` folder of the data folder. Separate several values with commas. `1` records what **Record** on the **SYSTEM** page of the settings records: the frame timeline, the frame and pointer monitors, present statistics, and GPU time for each pass. For more information, see [Diagnostics](diagnostics.md). |
 | `--timeline FILE` | Where the recorded timeline goes. The default is `diagnostics/timeline-PROCESS-ID.bin` in the data folder. |
 | `--console-log 1` | Keeps the log on the console instead of writing `logs/latest.log` in the settings folder. When the output already goes to a pipe or a file, the log stays there without this argument. |
 | `--gpu-validation 1` or `--gpu-validation 2` | Turns on the graphics API's validation layer. `1` is the Direct3D 12 debug layer, or the Khronos validation layer when it is installed. `2` also turns on Direct3D 12 GPU-based validation. After a lost Direct3D 12 device, the log lists the objects that were still alive (`[D3D12-LIVE-OBJECT]`). The game runs much slower with validation on. |

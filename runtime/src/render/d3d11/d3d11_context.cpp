@@ -83,6 +83,17 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
             adapter.Reset();
         }
     }
+    {
+        // Every hardware adapter, in that order, for the System page's GRAPHICS CARD choice.
+        std::vector<GpuChoice> choices;
+        for (const ComPtr<IDXGIAdapter1>& adapter : adapters) {
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(adapter->GetDesc1(&d)) && (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0u) {
+                choices.push_back(GpuChoice{gpu_identity(d.VendorId, d.DeviceId, d.SubSysId), narrow(d.Description)});
+            }
+        }
+        record_gpu_choices(std::move(choices));
+    }
     // The chosen adapter first, when the settings name one (config.ini gpu=, as gpu_identity writes it: Direct3D 12's
     // and Vulkan's rule).
     if (!chosen_gpu.empty()) {

@@ -108,6 +108,38 @@ std::vector<SettingsRow> general_page(const RuntimeSettings& runtime, RuntimeSet
                                       "FILES PUT HERE ARE IMPORTED AT EVERY START"));
         }
     }
+    if (state.saves_offered) {
+        rows.push_back({"SAVES", {}, nullptr, {}, true});
+        switch (state.saves_step) {
+        case SavesStep::Confirm:
+            rows.push_back(button_row("IMPORT SAVES", {state.saves_replace ? "REPLACE" : "IMPORT", "CANCEL"},
+                                      [&host](RenderConfig&, unsigned index) {
+                                          host.act(index == 0u ? GeneralPageAction::ConfirmImport : GeneralPageAction::CancelImport);
+                                      },
+                                      state.saves_replace ? "REPLACES YOUR SAVE AND RESTARTS THE GAME. THE CURRENT SAVE IS BACKED UP"
+                                                          : "ADDS THE SAVE AND RESTARTS THE GAME"));
+            break;
+        case SavesStep::Importing: rows.push_back({"IMPORT SAVES", "IMPORTING", nullptr, {}}); break;
+        default:
+            rows.push_back(button_row("IMPORT SAVES", {"IMPORT"}, [&host](RenderConfig&, unsigned) { host.act(GeneralPageAction::ImportSaves); },
+                                      state.saves_step == SavesStep::Choosing ? std::string("CHOOSING A FILE")
+                                      : state.saves_import_status.empty()
+                                          ? std::string("A WII, DOLPHIN OR SWITCH SAVE, OR A NEBULA BACKUP")
+                                          : state.saves_import_status));
+            break;
+        }
+        if (state.saves_step == SavesStep::Exporting) {
+            rows.push_back({"EXPORT SAVES", "EXPORTING", nullptr, {}});
+        } else {
+            rows.push_back(button_row("EXPORT SAVES", {"EXPORT"}, [&host](RenderConfig&, unsigned) { host.act(GeneralPageAction::ExportSaves); },
+                                      state.saves_export_status.empty() ? std::string("ALL YOUR SAVES IN ONE ZIP FILE")
+                                                                        : state.saves_export_status));
+        }
+        if (state.folders_open) {
+            rows.push_back(button_row("SAVES FOLDER", {"OPEN"}, [&host](RenderConfig&, unsigned) { host.act(GeneralPageAction::OpenSaveFolder); },
+                                      "REPLACED SAVES ARE KEPT IN A BACKUP FOLDER BESIDE IT"));
+        }
+    }
     return rows;
 }
 

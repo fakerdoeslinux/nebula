@@ -49,6 +49,8 @@ static std::atomic<std::uint64_t> s_config_generation{1u};
 static std::uint64_t s_config_write_time = 0u;
 // The gpu config.ini named when this process last read or wrote it (next_start_gpu).
 static std::array<char, 32> s_file_gpu{};
+// s_file_gpu was chosen in the game's menu (choose_next_start_gpu): saves write it, not what the file holds.
+static bool s_gpu_chosen_here = false;
 // No config.ini when the process started (render_config_first_start).
 static std::atomic<bool> s_first_start{false};
 
@@ -625,6 +627,7 @@ bool reload_render_config_if_changed() {
     s_config_generation.fetch_add(1u, std::memory_order_release);
     s_config_write_time = write_time;
     s_file_gpu = file_gpu;
+    s_gpu_chosen_here = false;  // an edit made outside the game is the newer choice
     s_lock.unlock();
     return true;
 }
@@ -642,9 +645,11 @@ bool save_render_config_to_file() {
     if (path.empty()) {
         return false;
     }
-    // The game never chooses the GPU: it writes back the gpu the file names now, which Nebula Settings may have
-    // changed since the game last read it.
-    {
+    // The GPU the menu chose; else the gpu the file names now (an edit made outside the game since it last read it).
+    s_lock.lock_shared();
+    const bool chosen_here = s_gpu_chosen_here;
+    s_lock.unlock_shared();
+    if (!chosen_here) {
         if (FILE* f = galaxy::open_path(path, "r"); f != nullptr) {
             RenderConfig file{};
             parse_ini(f, file);
@@ -741,6 +746,32 @@ std::string next_start_gpu() {
     const std::array<char, 32> gpu = s_file_gpu;
     s_lock.unlock_shared();
     return gpu.data();
+}
+
+namespace {
+std::mutex s_gpu_choices_lock;
+std::vector<GpuChoice> s_gpu_choices;
+}  // namespace
+
+void record_gpu_choices(std::vector<GpuChoice> choices) noexcept {
+    const std::lock_guard<std::mutex> lock(s_gpu_choices_lock);
+    s_gpu_choices = std::move(choices);
+}
+
+std::vector<GpuChoice> gpu_choices() {
+    const std::lock_guard<std::mutex> lock(s_gpu_choices_lock);
+    return s_gpu_choices;
+}
+
+bool choose_next_start_gpu(const std::string& identity) {
+    std::array<char, 32> gpu{};
+    if (identity.size() >= gpu.size()) return false;
+    std::memcpy(gpu.data(), identity.data(), identity.size());
+    s_lock.lock();
+    s_file_gpu = gpu;
+    s_gpu_chosen_here = true;
+    s_lock.unlock();
+    return save_render_config_to_file();
 }
 
 namespace {

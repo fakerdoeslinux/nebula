@@ -55,11 +55,13 @@ ROWS = [
      "platform/apple/**/*.plist*", r"CFBundleURLSchemes[\s\S]*nebula", "yes"),
     # Windows (the installer writes the registry)
     ("windows", "file association .luma", "6.1 import: double click, Open with",
-     "installer/src/Setup/*.cs", r'CreateSubKey\(@"Software\\Classes\\\.luma"\)', "yes"),
+     "installer/native/setup_engine.cpp", r'Key extension\(L"Software\\\\Classes\\\\\.luma"\)', "yes"),
     ("windows", "link scheme nebula://", "6.1 import by link",
-     "installer/src/Setup/*.cs", r'SetValue\("URL Protocol", ""\)', "yes"),
-    ("windows", "launcher takes a nebula:// link", "6.1 import by link",
-     "installer/src/Launcher/*.cs", r'"--open-link"', "yes"),
+     "installer/native/setup_engine.cpp", r'Set\(L"URL Protocol", L""\)', "yes"),
+    ("windows", "both open the install's Nebula.exe with --import", "6.1 import: double click, by link",
+     "installer/native/setup_engine.cpp", r'L"\\"" \+ starter \+ L"\\" --import \\"%1\\""', "yes"),
+    ("windows", "the game imports --import's files and links", "6.1 import: double click, by link",
+     "runtime/src/render/host_window_win32.cpp", r'launch_args\(\)\.imports', "yes"),
     ("linux", "SDL host imports --import's files (the desktop entry's %u)", "6.1 import: Open with, by link",
      "platform/sdl/host_window_sdl.cpp", r'launch_args\(\)\.imports', "yes"),
     # Linux

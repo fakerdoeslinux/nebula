@@ -246,7 +246,7 @@ inline constexpr unsigned kAspectRatios[kAspectModeCount][2] = {
 inline constexpr const char* kAspectNames[kAspectModeCount] = {"auto", "4:3", "3:2", "16:10", "16:9", "21:9", "32:9"};
 
 // Window sizes of exactly an aspect_mode's shape that fit max_width x max_height, smallest first; none for
-// aspect_mode 0. The launcher's GraphicsSettings.AspectWindowSizes lists the same sizes.
+// aspect_mode 0.
 inline std::vector<std::pair<unsigned, unsigned>> aspect_window_sizes(
     unsigned aspect_mode, unsigned max_width, unsigned max_height) {
     static constexpr unsigned kHeights[] = {
@@ -398,12 +398,25 @@ void apply_performance_preset(RenderConfig& cfg) noexcept;
 // "vvvv:dddd:ssssssss". The subsystem tells two boards of the same chip apart.
 std::string gpu_identity(unsigned vendor_id, unsigned device_id, unsigned subsys_id);
 
-// The gpu config.ini names, which the next start renders on. Nebula Settings owns the key: a reload
-// takes it here and leaves RenderConfig::gpu as the session started, and every save writes the value
-// the file has at that moment (this one when it cannot be read), never GALAXY_GPU.
+// The gpu config.ini names, which the next start renders on. A reload takes it here and leaves RenderConfig::gpu as
+// the session started; a save writes the one choose_next_start_gpu chose, else the value the file has at that moment
+// (an edit made outside the game; this one when it cannot be read), never GALAXY_GPU.
 std::string next_start_gpu();
 
-// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the launcher, which offers DLSS only
+// A GPU the renderer could run on: its gpu_identity() and its name (UTF-8).
+struct GpuChoice {
+    std::string identity;
+    std::string name;
+};
+// The GPUs the renderer found at its start, in the order its automatic choice takes them (software renderers left
+// out). Each backend records them as it chooses its device.
+void record_gpu_choices(std::vector<GpuChoice> choices) noexcept;
+[[nodiscard]] std::vector<GpuChoice> gpu_choices();
+// The GPU the next start renders on: one of gpu_choices()' identities, or empty for the automatic choice. Written to
+// config.ini at once; this session keeps the GPU it started on.
+bool choose_next_start_gpu(const std::string& identity);
+
+// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the settings, which offer DLSS only
 // on an NVIDIA RTX adapter: description (UTF-8), PCI vendor and device id, its gpu_identity() and whether it runs
 // Nebula's ray tracing.
 void record_render_adapter(const char* description, unsigned vendor_id, unsigned device_id,

@@ -13,6 +13,10 @@ class Host final : public galaxy::ui::GeneralPageHost {
 public:
     bool empty_languages = false;
     bool focus_offered = false;
+    bool saves = false;
+    galaxy::ui::SavesStep step = galaxy::ui::SavesStep::Idle;
+    bool replace = false;
+    std::string status;
     mutable int action = -1;
     galaxy::ui::GeneralPageState query(const galaxy::RuntimeSettings& settings) const override {
         galaxy::ui::GeneralPageState state;
@@ -21,6 +25,10 @@ public:
         if (!empty_languages) state.languages = {galaxy::GameLanguage::English, galaxy::GameLanguage::French};
         state.mii_count = 3;
         state.focus_loss_offered = focus_offered;
+        state.saves_offered = saves;
+        state.saves_step = step;
+        state.saves_replace = replace;
+        state.saves_import_status = status;
         return state;
     }
     void act(galaxy::ui::GeneralPageAction value) const override { action = static_cast<int>(value); }
@@ -66,6 +74,38 @@ int main() {
         check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::ImportMiis), "import action");
         row(rows, "MIIS FOLDER").press(render, 0);
         check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::OpenMiiFolder), "folder action");
+        check(std::none_of(rows.begin(), rows.end(), [](const auto& r) { return r.label == "IMPORT SAVES"; }),
+              "no SAVES rows without a save folder");
+        host.saves = true;
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check(row(rows, "IMPORT SAVES").buttons == std::vector<std::string>{"IMPORT"}, "import button");
+        row(rows, "IMPORT SAVES").press(render, 0);
+        check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::ImportSaves), "import saves action");
+        row(rows, "EXPORT SAVES").press(render, 0);
+        check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::ExportSaves), "export saves action");
+        row(rows, "SAVES FOLDER").press(render, 0);
+        check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::OpenSaveFolder), "saves folder action");
+        host.status = "THIS SAVE IS DAMAGED";
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check(row(rows, "IMPORT SAVES").help == "THIS SAVE IS DAMAGED", "an import's result is the row's help");
+        host.status.clear();
+        host.step = galaxy::ui::SavesStep::Confirm;
+        host.replace = true;
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check((row(rows, "IMPORT SAVES").buttons == std::vector<std::string>{"REPLACE", "CANCEL"}), "confirm asks Replace");
+        row(rows, "IMPORT SAVES").press(render, 0);
+        check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::ConfirmImport), "replace confirms");
+        row(rows, "IMPORT SAVES").press(render, 1);
+        check(host.action == static_cast<int>(galaxy::ui::GeneralPageAction::CancelImport), "cancel cancels");
+        host.replace = false;
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check(row(rows, "IMPORT SAVES").buttons.front() == "IMPORT", "nothing to replace: the confirm says Import");
+        host.step = galaxy::ui::SavesStep::Importing;
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check(row(rows, "IMPORT SAVES").value == "IMPORTING" && row(rows, "IMPORT SAVES").buttons.empty(), "importing shows its state");
+        host.step = galaxy::ui::SavesStep::Exporting;
+        rows = galaxy::ui::general_page(runtime, runtime, host);
+        check(row(rows, "EXPORT SAVES").value == "EXPORTING", "exporting shows its state");
         std::cout << "General page: passed\n";
         return 0;
     } catch (const std::exception& error) {

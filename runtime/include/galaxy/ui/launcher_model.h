@@ -18,10 +18,12 @@ struct LauncherModel {
     static constexpr int kChoicePlay = 0;
     static constexpr int kChoiceQuit = 1;
     static constexpr int kChoiceBenchmark = 2;  // the game leaves as for Quit; the host starts again into the benchmark
+    static constexpr int kChoiceUpdate = 3;     // the notice's Update: the game leaves as for Quit; the host's Setup updates
     // view(): the selected answer in bits 0-7, the page in bits 8-15, kLauncherView (the HOME Menu's views never have
     // it) and kNoBenchmark where the host cannot start the benchmark (no restart: iOS, Android's own launcher): the rows
     // are then Play, Settings, Quit. Pages: 0 the rows, 1 the notice's, 2 the message's, 3 the upload question (its
-    // answers Don't send, Show the full report, Send), 4 sending, 5 sent, 6 not sent (each over Back).
+    // answers Don't send, Show the full report, Send), 4 sending, 5 sent, 6 not sent (each over Back). The notice's page
+    // has kNoticeInstall where this install updates itself (its answers Update, Later), else its one answer Back.
     static constexpr unsigned kNoticePage = 1u << 8;
     static constexpr unsigned kMessagePage = 2u << 8;
     static constexpr unsigned kUploadPage = 3u << 8;
@@ -30,8 +32,11 @@ struct LauncherModel {
     static constexpr unsigned kNotSentPage = 6u << 8;
     static constexpr unsigned kLauncherView = 1u << 16;
     static constexpr unsigned kNoBenchmark = 1u << 17;
+    static constexpr unsigned kNoticeInstall = 1u << 18;
     // The upload question's answers, in its order; Don't send is the one selected first.
     enum Upload : unsigned { UploadNo, UploadShow, UploadSend, UploadNum };
+    // The notice's answers where the install updates itself, in its order; Update is the one selected first.
+    enum Notice : unsigned { NoticeUpdate, NoticeLater, NoticeNum };
 
     // What an answer asks beyond the model, done by the caller with the lock released.
     enum class Effect { None, OpenSettings, ShowReport, SendReport, UploadLeft };
@@ -42,6 +47,8 @@ struct LauncherModel {
     unsigned row = RowPlay;  // the selected answer's place among the rows shown
     bool notice_page = false;
     bool notice_held = false;
+    bool installs = false;  // the notice offers Update (set with the offer)
+    unsigned notice_answer = NoticeUpdate;
     bool message_page = false;  // shown until its answer; then never again
     unsigned upload_page = 0u;  // 3-6 while the upload's pages show (once), else 0
     unsigned upload_answer = UploadNo;
@@ -51,6 +58,7 @@ struct LauncherModel {
         const std::lock_guard<std::mutex> lock(mutex);
         row = RowPlay;
         notice_page = notice_held;
+        notice_answer = NoticeUpdate;
         choice.store(-1, std::memory_order_relaxed);
         visible.store(true, std::memory_order_release);
     }
@@ -78,9 +86,11 @@ struct LauncherModel {
     }
 
     // An update was found: its page shows over the rows (now, when they show).
-    void offer_notice() {
+    void offer_notice(bool can_install) {
         const std::lock_guard<std::mutex> lock(mutex);
         if (!notice_held) {
+            installs = can_install;
+            notice_answer = NoticeUpdate;
             notice_held = true;
             notice_page = true;
         }
@@ -92,7 +102,7 @@ struct LauncherModel {
         const unsigned shown = message_page        ? kMessagePage
                                : upload_page == 3u ? kUploadPage | upload_answer
                                : upload_page != 0u ? upload_page << 8
-                               : notice_page       ? kNoticePage
+                               : notice_page       ? kNoticePage | (installs ? kNoticeInstall | notice_answer : 0u)
                                                    : row;
         return static_cast<int>(shown | kLauncherView | (benchmark ? 0u : kNoBenchmark));
     }
@@ -102,6 +112,8 @@ struct LauncherModel {
         if (!visible.load(std::memory_order_relaxed) || answer >= answers()) return;
         if (asking()) {
             upload_answer = answer;
+        } else if (choosing()) {
+            notice_answer = answer;
         } else if (!paged()) {
             row = answer;
         }
@@ -114,6 +126,8 @@ struct LauncherModel {
         }
         if (asking()) {
             upload_answer = answer;
+        } else if (choosing()) {
+            notice_answer = answer;
         } else if (!paged()) {
             row = answer;
         }
@@ -128,6 +142,8 @@ struct LauncherModel {
         case LauncherAction::Previous:
             if (asking()) {
                 upload_answer = (upload_answer + UploadNum - 1u) % UploadNum;
+            } else if (choosing()) {
+                notice_answer = (notice_answer + NoticeNum - 1u) % NoticeNum;
             } else if (!paged()) {
                 row = (row + rows() - 1u) % rows();
             }
@@ -135,6 +151,8 @@ struct LauncherModel {
         case LauncherAction::Next:
             if (asking()) {
                 upload_answer = (upload_answer + 1u) % UploadNum;
+            } else if (choosing()) {
+                notice_answer = (notice_answer + 1u) % NoticeNum;
             } else if (!paged()) {
                 row = (row + 1u) % rows();
             }
@@ -155,7 +173,9 @@ struct LauncherModel {
 private:
     bool paged() const { return message_page || upload_page != 0u || notice_page; }
     bool asking() const { return !message_page && upload_page == 3u; }
-    unsigned answers() const { return asking() ? unsigned{UploadNum} : paged() ? 1u : rows(); }
+    // The notice's page with its two answers (the message's and the upload's pages show before it).
+    bool choosing() const { return notice_page && installs && !message_page && upload_page == 0u; }
+    unsigned answers() const { return asking() ? unsigned{UploadNum} : choosing() ? unsigned{NoticeNum} : paged() ? 1u : rows(); }
 
     // Back (and a page's one answer): the message's page goes to the upload's, the upload's (No, or after its answer)
     // to the notice's when one is up, the notice's to the rows. The send itself, once started, goes on.
@@ -179,6 +199,10 @@ private:
             case UploadSend: upload_page = 4u; return Effect::SendReport;
             default: return leave_page();
             }
+        }
+        if (choosing() && notice_answer == NoticeUpdate) {
+            close(kChoiceUpdate);
+            return Effect::None;
         }
         if (paged()) {
             return leave_page();

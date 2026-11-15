@@ -102,6 +102,7 @@
 #include "galaxy/ui/launcher_model.h"
 #if defined(NEBULA_UPDATE_CHECK)
 #include "galaxy/update.h"
+#include "galaxy/save_transfer.h"
 #endif
 #endif
 #include <nebula_frame_list.h>
@@ -598,7 +599,7 @@ std::vector<galaxy::modlog::StartPackage> gStartPackages;
 
 // The two folders the host reads from (the package layout):
 // - the program's folder (program_directory(), executable_path()): one for both CPU levels, since Nebula.exe and
-//   Nebula-x86-64-v2.exe lie side by side. Tables, dxc\, nebula-import.exe, the launcher, the restart's and the
+//   Nebula-x86-64-v2.exe lie side by side. Tables, dxc\, nebula-import.exe, the restart's and the
 //   crash report's program come from there.
 // - module_folder(): the folder of the game module actually loaded (the program's folder, x86-64-v2\ on a CPU without
 //   x86-64-v3, or --module's folder). Everything that belongs to one build of the module is read from here, never from
@@ -3632,7 +3633,7 @@ int svc_home_menu(void*, uint32_t what, uint32_t value) {
 #if defined(NEBULA_UPDATE_CHECK)
         if (opened) {
             if (const std::optional<galaxy::update::Release> release = galaxy::update::offer(galaxy::update::kFreshBudgetMs)) {
-                galaxy::ui::launcher_offer_update(release->version, release->notes);
+                galaxy::ui::launcher_offer_update(release->version, release->notes, galaxy::update::can_install());
                 gUpdateOffered = true;
             }
         }
@@ -3644,10 +3645,21 @@ int svc_home_menu(void*, uint32_t what, uint32_t value) {
         // An answer that came after the screen opened (never waits).
         if (!gUpdateOffered && galaxy::ui::launcher_visible()) {
             if (const std::optional<galaxy::update::Release> release = galaxy::update::poll()) {
-                galaxy::ui::launcher_offer_update(release->version, release->notes);
+                galaxy::ui::launcher_offer_update(release->version, release->notes, galaxy::update::can_install());
                 gUpdateOffered = true;
             }
         }
+#if !defined(_WIN32)
+        // The notice's Update on Linux and macOS: the update downloads and installs behind the game, which goes on as
+        // for Play; the System page shows its progress and restarts into it. (On Windows Nebula Setup installs it once
+        // the game has left: svc_app_exit.)
+        if (galaxy::ui::launcher_poll() == galaxy::ui::LauncherModel::kChoiceUpdate) {
+            if (const std::optional<galaxy::update::Release> release = galaxy::update::poll()) {
+                if (!galaxy::update::start_install(*release)) log_line("host:", "the update could not start");
+            }
+            return galaxy::ui::LauncherModel::kChoicePlay;
+        }
+#endif
 #endif
         return galaxy::ui::launcher_poll();
     case NEBULA_HOME_MENU_LAUNCHER_TEXT:
@@ -3859,18 +3871,6 @@ bool one_game_at_a_time() {
     return true;
 }
 
-// The launcher's sign that the game runs (Launcher.RuntimeLeaseHeld): a named mutex for the release, held by the main
-// thread until the process ends.
-HANDLE gRuntimeLease = nullptr;
-
-void hold_runtime_lease() {
-    std::wstring name = L"Local\\Nebula.";
-    for (const char* c = gPak.id; *c != '\0'; ++c) {
-        name += static_cast<wchar_t>(*c);
-    }
-    name += L".NativeRuntime";
-    gRuntimeLease = CreateMutexW(nullptr, TRUE, name.c_str());
-}
 #endif
 
 // Whether finish_and_exit(true) starts the game again on this host (Windows: a new process; Android: the activity's
@@ -4176,9 +4176,6 @@ void start_again_on_d3d11(const char* why) {
         if (gOneGame != nullptr) {
             CloseHandle(gOneGame);  // the new process takes it
         }
-        if (gRuntimeLease != nullptr) {
-            CloseHandle(gRuntimeLease);
-        }
 #endif
         const std::wstring path = gStartAgainProgram.empty() ? ::galaxy::windows::executable_path() : gStartAgainProgram;
         if (!path.empty()) {
@@ -4315,6 +4312,12 @@ void svc_app_exit(void*) {
         for (const char* argument : {"--benchmark", "1", "--benchmark-return", "1"}) add_restart_argument(argument);
         finish_and_exit(true);
     }
+#if defined(NEBULA_UPDATE_CHECK) && defined(_WIN32)
+    // The notice's Update: Nebula Setup installs it once the game has left.
+    if (galaxy::ui::launcher_poll() == galaxy::ui::LauncherModel::kChoiceUpdate && !galaxy::update::start_setup_update()) {
+        log_line("host:", "Nebula Setup could not start to install the update");
+    }
+#endif
 #endif
     finish_and_exit(false);
 }
@@ -4531,7 +4534,7 @@ void svc_app_restart(void*) {
 }
 
 
-// The launcher's mod tools (run_mods_tool): the first argument names one.
+// The mod tools (run_mods_tool): the first argument names one.
 bool is_mods_tool(std::string_view first) {
     return first == "--import-mod" || first == "--list-mods" || first == "--remove-mod";
 }
@@ -4809,7 +4812,7 @@ void cook_mod_files(const galaxy::mods::ModPlan& plan, const fs::path& settings_
             return false;
         }
 #else
-        // The importer's library, as the launcher loads it.
+        // The importer's library.
         using CookOverlay = int (*)(const char*, const char*);
         void* const library = dlopen("libnebula_import.so", RTLD_NOW | RTLD_LOCAL);
         const auto cook = library != nullptr ? reinterpret_cast<CookOverlay>(dlsym(library, "nebula_cook_overlay")) : nullptr;
@@ -4938,7 +4941,7 @@ bool read_game_id(const fs::path& path, std::string& id) {
     return true;
 }
 
-// The launcher's mod tools: Nebula --import-mod <folder or archive>..., --remove-mod <id> or --list-mods
+// The mod tools: Nebula --import-mod <folder or archive>..., --remove-mod <id> or --list-mods
 // [--game <id>] [--pak <game.pak>] [--data, --settings or --crash-dumps <folder>], on the mods folder beside the
 // settings (as the game uses it; the folder options read_launch_args took). One JSON line on stdout; exit code 0 when
 // everything succeeded.
@@ -5250,7 +5253,7 @@ int main(int argc, char** argv) {
     }
 #endif
 #if defined(NEBULA_HOST_RENDERER) && defined(_WIN32)
-    // A player's start has nowhere to print (a launcher with no terminal, or none): the log goes to logs/latest.log beside the
+    // A player's start has nowhere to print (a shortcut with no terminal): the log goes to logs/latest.log beside the
     // settings, the last start's to previous.log. A test or a shell capturing the output to a pipe or a file keeps it.
     {
         const DWORD output = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
@@ -5363,7 +5366,7 @@ int main(int argc, char** argv) {
     [[maybe_unused]] bool benchmark = false;  // --benchmark 1: benchmark.h's run, then exit
     [[maybe_unused]] bool benchmark_return = false;  // --benchmark-return 1: then the home screen again
     fs::path benchmark_out, benchmark_result;
-    [[maybe_unused]] int home = -1;  // --home: the launcher's home screen at the title's hold; -1 the platform's default
+    [[maybe_unused]] int home = -1;  // --home: the home screen at the title's hold; -1 the platform's default
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string key = argv[i];
         if (key == "--pak") {
@@ -5465,9 +5468,6 @@ int main(int argc, char** argv) {
     boot_mark("game module loaded");
 #if defined(NEBULA_HOST_RENDERER)
     galaxy::render::set_texture_pack_game_id(gPak.id);  // packs' and dumps' game folders: the disc's release
-#if defined(_WIN32)
-    hold_runtime_lease();
-#endif
     if (!galaxy::bench::running()) {  // a benchmark's game has no Miis: their library is in the save folder
         // Mii import: the files in the import folder (next to the settings: any Mii files, mii_formats.h)
         // join the library before the game reads it; the settings import more while it runs.
@@ -5505,6 +5505,7 @@ int main(int argc, char** argv) {
         gOldSaveDataPath = save_folders.earlier;
         gSaveDataPath = save_folders.current;
         if (!gSaveRoot.empty()) fs::create_directories(gSaveRoot / gSaveDataPath.substr(1), error);  // the release's own save folder
+        if (!gSaveRoot.empty()) galaxy::save_transfer::set_game_saves(gSaveRoot, std::string_view(gPak.id, 4));  // SAVES rows
         galaxy::luma_mods::set_save_half({kept_save_ids, kept_save_bytes, forget_save});
         if (!settings_folder.empty()) {
             fs::create_directories(settings_folder / "mods", error);
@@ -5753,10 +5754,10 @@ int main(int argc, char** argv) {
                 galaxy::ui::launcher_visible();
         },
         [](std::uintptr_t key) noexcept { galaxy::render::native_settings_post_key(key); });
-#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+#if !defined(__ANDROID__)
     constexpr bool kHomeByDefault = true;  // no launcher app: the home screen is where a start begins
 #else
-    constexpr bool kHomeByDefault = false;  // the Windows and Android launcher apps are the home screen there
+    constexpr bool kHomeByDefault = false;  // the Android app is the home screen there
 #endif
     // Tests (a hidden start, a timed run) start straight into the game unless they ask for it.
 #if defined(_WIN32) || defined(NEBULA_HOST_START_AGAIN)
@@ -6025,6 +6026,23 @@ int main(int argc, char** argv) {
         add_restart_argument(galaxy::bench::result_file());
         finish_and_exit(true);
     }
+#endif
+#if defined(NEBULA_HOST_RENDERER)
+    // The settings menu's restart (host_window::restart_game): the window closed for it; the game starts again, as a
+    // diagnostics run when it asked for one.
+    if (const int wanted = galaxy::render::host_window::restart_wanted(); wanted != 0) {
+        if (wanted == 2) {
+            add_restart_argument("--diagnostics");
+            add_restart_argument("1");
+        }
+        finish_and_exit(true);
+    }
+#if defined(NEBULA_UPDATE_CHECK) && defined(_WIN32)
+    // The notice's Update: Nebula Setup installs it once the game has left.
+    if (galaxy::ui::launcher_poll() == galaxy::ui::LauncherModel::kChoiceUpdate && !galaxy::update::start_setup_update()) {
+        log_line("host:", "Nebula Setup could not start to install the update");
+    }
+#endif
 #endif
     finish_and_exit(false);
 }

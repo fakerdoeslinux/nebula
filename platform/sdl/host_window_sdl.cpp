@@ -44,6 +44,9 @@ namespace galaxy::render::vk {
 #include "galaxy/virtual_keys.h"
 
 #include <SDL3/SDL.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #if defined(NEBULA_GPU_METAL)
 #include <SDL3/SDL_metal.h>
 #else
@@ -1130,17 +1133,11 @@ void pump_events(int timeout_ms) noexcept {
     std::vector<std::filesystem::path> dropped;
 #if !defined(__ANDROID__)
     // What the system opened Nebula with (--import; the desktop entry's %u), at the first pump: a
-    // file goes where a drop goes, as on Windows (host_window_win32.cpp). A nebula:// link is 6.1's import by link,
-    // which waits on net.internet: said in the log, nothing else.
+    // file goes where a drop goes, as on Windows (host_window_win32.cpp); a nebula:// link too, which opens the MODS
+    // page (native_settings_files_dropped).
     if (!g_imports_given) {
         g_imports_given = true;
-        for (const std::filesystem::path& opened : galaxy::launch_args().imports) {
-            if (galaxy::path_text(opened).rfind("nebula:", 0) == 0) {
-                std::fprintf(stderr, "[open] a nebula:// link: links are not imported yet\n");
-            } else {
-                dropped.push_back(opened);
-            }
-        }
+        for (const std::filesystem::path& opened : galaxy::launch_args().imports) dropped.push_back(opened);
     }
 #endif
     bool luma_display = false;  // LumaCore's display snapshot changes (services-system 4), read after the events
@@ -1729,7 +1726,58 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
         done({});
         return;
     }
-    galaxy::sdl::call_activity(galaxy::sdl::ActivityCall{"pickFiles", true, kind == FilePick::Miis ? 0 : 1});
+    galaxy::sdl::call_activity(
+        galaxy::sdl::ActivityCall{"pickFiles", true, kind == FilePick::Miis ? 0 : kind == FilePick::Saves ? 2 : 1});
+}
+
+// The save dialog (GameActivity.saveCopy: a document the player creates, the file copied into it). One at a time.
+namespace {
+std::mutex g_save_copy_mutex;
+std::function<void(SaveCopy)> g_save_copy_done;
+std::string g_save_copy_file;
+}  // namespace
+
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    bool busy = false;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        busy = static_cast<bool>(g_save_copy_done);
+        if (!busy) {
+            g_save_copy_done = std::move(done);
+            g_save_copy_file = galaxy::path_text(file);
+        }
+    }
+    if (busy) {
+        done(SaveCopy::Failed);
+        return;
+    }
+    galaxy::sdl::call_activity("saveCopy");
+}
+
+// The file saveCopy offers, as UTF-8 bytes; empty when none is asked for.
+extern "C" JNIEXPORT jbyteArray JNICALL Java_dev_nebula_galaxy_GameActivity_nativeSaveCopyFile(JNIEnv* env, jclass) {
+    std::string file;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        if (g_save_copy_done) file = g_save_copy_file;
+    }
+    jbyteArray bytes = env->NewByteArray(static_cast<jsize>(file.size()));
+    if (bytes != nullptr && !file.empty()) {
+        env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(file.size()), reinterpret_cast<const jbyte*>(file.data()));
+    }
+    return bytes;
+}
+
+// saveCopy's answer: 0 saved, 1 cancelled, 2 failed.
+extern "C" JNIEXPORT void JNICALL Java_dev_nebula_galaxy_GameActivity_nativeCopySaved(JNIEnv*, jclass, jint result) {
+    std::function<void(SaveCopy)> done;
+    {
+        const std::lock_guard<std::mutex> lock(g_save_copy_mutex);
+        done = std::move(g_save_copy_done);
+        g_save_copy_done = nullptr;
+        g_save_copy_file.clear();
+    }
+    if (done) done(result == 0 ? SaveCopy::Saved : result == 1 ? SaveCopy::Cancelled : SaveCopy::Failed);
 }
 
 // The picker's answer: the copies' paths as UTF-8 bytes (JNI's own strings are modified UTF-8), none when cancelled.
@@ -1792,8 +1840,43 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
     static constexpr SDL_DialogFileFilter kMods[] = {
         {"Mods and texture packs (luma, zip, 7z, rar, tar)", "luma;zip;7z;rar;tar;tgz;gz;txz;xz;tbz2;bz2;tzst;zst"},
         {"All files", "*"}};
-    const SDL_DialogFileFilter* filters = kind == FilePick::Miis ? kMiis : kMods;
-    SDL_ShowOpenFileDialog(picked, request, galaxy::sdl::g_window, filters, 2, nullptr, true);
+    static constexpr SDL_DialogFileFilter kSaves[] = {
+        {"Saves (zip, Nebula.sav, GameData.bin, Wii SD data.bin)", "zip;sav;bin"},
+        {"All files", "*"}};
+    const SDL_DialogFileFilter* filters = kind == FilePick::Miis ? kMiis : kind == FilePick::Saves ? kSaves : kMods;
+    SDL_ShowOpenFileDialog(picked, request, galaxy::sdl::g_window, filters, 2, nullptr, kind != FilePick::Saves);
+}
+
+// SDL's save dialog; the file is copied where the player chose (a ".zip" added when the name has no extension).
+namespace {
+struct SaveRequest {
+    std::filesystem::path file;
+    std::function<void(SaveCopy)> done;
+};
+
+void SDLCALL save_chosen(void* userdata, const char* const* files, int) {
+    std::unique_ptr<SaveRequest> request(static_cast<SaveRequest*>(userdata));
+    if (files == nullptr) {
+        request->done(SaveCopy::Failed);
+        return;
+    }
+    if (files[0] == nullptr) {
+        request->done(SaveCopy::Cancelled);
+        return;
+    }
+    std::filesystem::path target(files[0]);
+    if (!target.has_extension()) target += ".zip";
+    std::error_code error;
+    std::filesystem::copy_file(request->file, target, std::filesystem::copy_options::overwrite_existing, error);
+    request->done(error ? SaveCopy::Failed : SaveCopy::Saved);
+}
+}  // namespace
+
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    static constexpr SDL_DialogFileFilter kZip[] = {{"Zip archive", "zip"}};
+    auto* request = new SaveRequest{file, std::move(done)};
+    const std::string name = galaxy::path_text(file.filename());
+    SDL_ShowSaveFileDialog(save_chosen, request, galaxy::sdl::g_window, kZip, 1, name.c_str());
 }
 
 // The file manager at the folder (made first, as on Windows).
@@ -1833,10 +1916,6 @@ unsigned dlss_min_width(unsigned, unsigned, unsigned) noexcept {
     return 0u;
 }
 
-bool launcher_available() {
-    return false;
-}
-
 bool dlss_files_present() {
     return false;
 }
@@ -1870,14 +1949,45 @@ VendorLicense vendor_license(std::string&) {
     return VendorLicense::Failed;
 }
 
-bool restart_game(bool) {
+void quit_game() noexcept {
+    quit_request.store(true, std::memory_order_release);
+}
+
 #if defined(__ANDROID__)
+bool restart_game(bool) {
     galaxy::sdl::call_activity("restartGame");
     return true;
-#else
-    return false;
-#endif
 }
+
+int restart_wanted() noexcept {
+    return 0;
+}
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+// An iOS app cannot start itself again (host_main kHostStartsAgain).
+bool restart_game(bool) {
+    return false;
+}
+
+int restart_wanted() noexcept {
+    return 0;
+}
+#else
+namespace {
+std::atomic<int> restart_request{0};  // restart_wanted: 0 none, 1 a start, 2 a diagnostics run
+}  // namespace
+
+// The game ends as for Quit, and the host starts it again as it leaves (host_main finish_and_exit: an exec of this
+// executable), with --diagnostics 1 for a diagnostics run.
+bool restart_game(bool record) {
+    restart_request.store(record ? 2 : 1, std::memory_order_release);
+    quit_request.store(true, std::memory_order_release);
+    return true;
+}
+
+int restart_wanted() noexcept {
+    return restart_request.load(std::memory_order_acquire);
+}
+#endif
 
 #if defined(NEBULA_GPU_METAL)
 // The Metal renderer on this host (a development build: Apple's own host is platform/apple/host): SDL's Metal view.

@@ -185,6 +185,7 @@ add_library(galaxy_render_vk STATIC
     ${rt}/atomic_file.cpp
     ${rt}/asset_store.cpp
     ${rt}/save_files.cpp
+    ${rt}/save_transfer.cpp
     ${rt}/mii_import.cpp
     ${rt}/mii_formats.cpp
     ${rt}/mod_xml.cpp
@@ -219,6 +220,8 @@ endif()
 include("${nebula_root}/third_party/boringssl.cmake")
 include("${nebula_root}/third_party/zlib_inflate.cmake")
 target_link_libraries(galaxy_render_vk PRIVATE nebula_bssl_ssl nebula_zinflate)
+# Save import (save_transfer.cpp) checks a GameData.bin with the game's own check (SaveFileFormat.hpp).
+set_property(SOURCE ${rt}/save_transfer.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${nebula_root}/native/petari/include")
 target_include_directories(galaxy_render_vk PUBLIC "${nebula_root}/runtime/src")
 target_include_directories(galaxy_render_vk PUBLIC "${nebula_root}/runtime/include")
 target_include_directories(galaxy_render_vk PRIVATE "${nebula_root}/third_party/smaa" "${nebula_root}/native/include" "${galaxy_utility_spirv_dir}")
@@ -317,7 +320,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
     target_sources(main PRIVATE ${rt}/update/update.cpp ${rt}/update/update_crypto.cpp ${rt}/update/update_transport_curl.cpp
         ${rt}/update/update_install_linux.cpp ${rt}/update/update_probe_posix.cpp)
     target_compile_definitions(main PRIVATE NEBULA_UPDATE_CHECK=1)
+    target_compile_definitions(galaxy_render_vk PRIVATE NEBULA_UPDATE_CHECK=1)  # the settings' UPDATES rows
     target_link_libraries(main PRIVATE ${CMAKE_DL_LIBS})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # macOS: NSURLSession for the check, the signed app bundle replaced in place (update_install_macos.mm).
+    target_sources(main PRIVATE ${rt}/update/update.cpp ${rt}/update/update_crypto.cpp ${rt}/update/update_transport_apple.mm
+        ${rt}/update/update_install_macos.mm ${rt}/update/update_probe_posix.cpp)
+    target_compile_definitions(main PRIVATE NEBULA_UPDATE_CHECK=1)
+    target_compile_definitions(galaxy_render_vk PRIVATE NEBULA_UPDATE_CHECK=1)
+    target_link_libraries(main PRIVATE "-framework Security" "-framework CFNetwork")
 endif()
 
 # The launcher's mod and Mii import on Android (libnebula_mods.so): the game's own importers, in the launcher's process.

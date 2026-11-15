@@ -957,7 +957,7 @@ int run_command_line(int argc, char** argv) {
         const Key public_half = x25519_public(secret);
         const auto id = key_id(public_half);
         std::printf("public key: %s\nkey id: %s\n", hex(public_half.data(), 32u).c_str(), hex(id.data(), 8u).c_str());
-        std::printf("runtime/include/galaxy/diag_endpoint.h: kPublicKey[] = \"%s\";\n", hex(public_half.data(), 32u).c_str());
+        std::printf("runtime/include/galaxy/diag_endpoint_local.h: kPublicKey[] =\"%s\";\n", hex(public_half.data(), 32u).c_str());
         const std::u8string shown = file.u8string();
         std::printf("private key: %s\nKeep the private key offline and backed up; never commit or share it.\n",
                     reinterpret_cast<const char*>(shown.c_str()));

@@ -91,10 +91,14 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
     static native void nativePadSensorRemoved(int id);
     static native void nativePadSensor(int id, int type, long timeNs, float x, float y, float z);
     static native void nativeFilesPicked(byte[][] paths);
+    static native byte[] nativeSaveCopyFile();
+    static native void nativeCopySaved(int result);
 
-    // The settings' Import (pickFiles): its own request code beside SDL's.
+    // The settings' Import (pickFiles) and Export (saveCopy): request codes of their own beside SDL's.
     private static final int PICK_FILES_REQUEST = 0x4E42;
+    private static final int SAVE_COPY_REQUEST = 0x4E43;
     private int pickKind;
+    private File saveCopyFile;
 
     private TouchControlsView controls;
     private boolean menuOpen;
@@ -549,16 +553,16 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
         });
     }
 
-    // Called by libmain.so: the settings' Import, Miis (kind 0) or mods and texture packs (1), on SDL's thread. The
-    // chosen documents are copied where the game reads them by path, then handed over (nativeFilesPicked); none when
-    // the picker is cancelled or cannot open.
+    // Called by libmain.so: the settings' Import, Miis (kind 0), mods and texture packs (1) or a save (2), on SDL's
+    // thread. The chosen documents are copied where the game reads them by path, then handed over (nativeFilesPicked);
+    // none when the picker is cancelled or cannot open.
     public void pickFiles(int kind) {
         runOnUiThread(() -> {
             pickKind = kind;
             final Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("*/*");
-            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, kind != 2);
             try {
                 startActivityForResult(intent, PICK_FILES_REQUEST);
             } catch (android.content.ActivityNotFoundException e) {
@@ -568,8 +572,61 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
         });
     }
 
+    // Called by libmain.so: the settings' Export, on SDL's thread. The player creates a document (the system's own
+    // dialog, under the file's name) and the file the game made is copied into it; nativeCopySaved answers 0 saved,
+    // 1 cancelled, 2 failed.
+    public void saveCopy() {
+        runOnUiThread(() -> {
+            final byte[] path = nativeSaveCopyFile();
+            saveCopyFile = path == null || path.length == 0
+                ? null : new File(new String(path, java.nio.charset.StandardCharsets.UTF_8));
+            if (saveCopyFile == null || !saveCopyFile.isFile()) {
+                nativeCopySaved(2);
+                return;
+            }
+            final Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/zip");
+            intent.putExtra(Intent.EXTRA_TITLE, saveCopyFile.getName());
+            try {
+                startActivityForResult(intent, SAVE_COPY_REQUEST);
+            } catch (android.content.ActivityNotFoundException e) {
+                Log.e(TAG, "no document creator", e);
+                nativeCopySaved(2);
+            }
+        });
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == SAVE_COPY_REQUEST) {
+            final File file = saveCopyFile;
+            saveCopyFile = null;
+            if (resultCode != RESULT_OK || data == null || data.getData() == null || file == null) {
+                nativeCopySaved(1);
+                return;
+            }
+            final android.net.Uri uri = data.getData();
+            new Thread(() -> {
+                int result = 0;
+                try (InputStream from = new java.io.FileInputStream(file);
+                     OutputStream to = getContentResolver().openOutputStream(uri, "wt")) {
+                    if (to == null) {
+                        result = 2;
+                    } else {
+                        final byte[] buffer = new byte[1 << 16];
+                        for (int read; (read = from.read(buffer)) >= 0; ) {
+                            to.write(buffer, 0, read);
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "the export could not be written", e);
+                    result = 2;
+                }
+                nativeCopySaved(result);
+            }, "Nebula Save Copy").start();
+            return;
+        }
         if (requestCode != PICK_FILES_REQUEST) {
             super.onActivityResult(requestCode, resultCode, data);
             return;
@@ -584,7 +641,7 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
                 uris.add(data.getData());
             }
         }
-        final File folder = new File(pickedFolder(), pickKind == 0 ? "miis" : "mods");
+        final File folder = new File(pickedFolder(), pickKind == 0 ? "miis" : pickKind == 2 ? "saves" : "mods");
         // Copied off the UI thread: a texture pack can be large.
         new Thread(() -> {
             deleteTree(folder);

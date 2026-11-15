@@ -265,8 +265,11 @@ namespace {
     // Launcher mode's home screen (NEBULA_HOME_MENU_LAUNCHER_*), drawn as the HOME Menu: views with bit 16; its rows,
     // on page 1 an update's notice ("{v}": its version) and its notes over Back, on page 2 the benchmark's message
     // (it gave no recommendation) over Back, on page 3 the benchmark report's upload question over its three answers
-    // (cLauncherUpload), on pages 4-6 the send's state (sending, sent, not sent) over Back.
+    // (cLauncherUpload), on pages 4-6 the send's state (sending, sent, not sent) over Back. A notice with bit 18 (the
+    // install updates itself) has Update and Later (cLauncherNotice) in place of Back.
     const s32 cLauncherView = 1 << 16;
+    const s32 cLauncherNoticeInstall = 1 << 18;
+    const char* const cLauncherNotice[] = {"LauncherInstall", "LauncherLater"};
     const char* const cLauncherUpload[] = {"Diag.DontSend", "Diag.ShowReport", "Diag.Send"};
     const char* const cLauncherQuestion[] = {"Diag.Question", "Diag.Why", "Diag.WhatSent", "Diag.NeverSent"};
     const char* const cLauncherSend[] = {"LauncherDiagSending", "Diag.Done", "Diag.Failed"};
@@ -2204,13 +2207,14 @@ void NebulaSettingsScreen::fillLauncher(s32 view) {
                 }
             }
         }
-        mChoiceCount = page == 3 ? 3 : notice ? 1 : rowNum;
+        const bool installs = notice && page == 1 && (view & cLauncherNoticeInstall) != 0;
+        mChoiceCount = page == 3 ? 3 : installs ? 2 : notice ? 1 : rowNum;
         for (s32 i = 0; i < ChoiceNum; i++) {
             Button& rChoice = mChoices[i];
             rChoice.mChip.mRoot->SetVisible(i < mChoiceCount);
             rChoice.mChip.mFocusLevel = 0.0f;
             if (i < mChoiceCount) {
-                fillButton(rChoice, page == 3 ? cLauncherUpload[i] : notice ? "SettingsBack" : pRows[i]);
+                fillButton(rChoice, page == 3 ? cLauncherUpload[i] : installs ? cLauncherNotice[i] : notice ? "SettingsBack" : pRows[i]);
                 fillKeyCap(rChoice.mKey, -1, 0, false);
             }
         }

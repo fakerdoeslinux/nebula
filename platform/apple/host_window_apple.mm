@@ -1351,7 +1351,11 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
             panel.allowsMultipleSelection = YES;
             panel.canChooseDirectories = kind == FilePick::ModFolders;
             panel.canChooseFiles = kind != FilePick::ModFolders;
-            panel.message = kind == FilePick::Miis ? @"Choose Mii files" : kind == FilePick::ModFolders ? @"Choose mod folders" : @"Choose mods or texture packs";
+            panel.allowsMultipleSelection = kind != FilePick::Saves;
+            panel.message = kind == FilePick::Miis         ? @"Choose Mii files"
+                            : kind == FilePick::ModFolders ? @"Choose mod folders"
+                            : kind == FilePick::Saves      ? @"Choose a save to import"
+                                                           : @"Choose mods or texture packs";
             g_panels.fetch_add(1, std::memory_order_relaxed);
             update_cursor();
             const auto finished = ^(NSModalResponse result) {
@@ -1365,6 +1369,39 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
                 }
                 g_panels.fetch_sub(1, std::memory_order_relaxed);
                 (*shared)(std::move(chosen));
+            };
+            if (g_window != nil) {
+                [panel beginSheetModalForWindow:g_window completionHandler:finished];
+            } else {
+                [panel beginWithCompletionHandler:finished];
+            }
+        }
+    });
+}
+
+// The system's save panel, answered on the main thread; the file is copied where the player chose.
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    using namespace galaxy::sdl;
+    auto shared = std::make_shared<std::function<void(SaveCopy)>>(std::move(done));
+    const std::filesystem::path source = file;
+    const std::string name = galaxy::path_text(file.filename());
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            NSSavePanel* const panel = [NSSavePanel savePanel];
+            panel.nameFieldStringValue = @(name.c_str());
+            panel.message = @"Export saves";
+            g_panels.fetch_add(1, std::memory_order_relaxed);
+            update_cursor();
+            const auto finished = ^(NSModalResponse result) {
+                SaveCopy outcome = SaveCopy::Cancelled;
+                if (result == NSModalResponseOK && panel.URL.fileSystemRepresentation != nullptr) {
+                    std::error_code error;
+                    std::filesystem::copy_file(source, std::filesystem::path(panel.URL.fileSystemRepresentation),
+                                               std::filesystem::copy_options::overwrite_existing, error);
+                    outcome = error ? SaveCopy::Failed : SaveCopy::Saved;
+                }
+                g_panels.fetch_sub(1, std::memory_order_relaxed);
+                (*shared)(outcome);
             };
             if (g_window != nil) {
                 [panel beginSheetModalForWindow:g_window completionHandler:finished];
@@ -1400,10 +1437,6 @@ unsigned dlss_min_width(unsigned, unsigned, unsigned) noexcept {
     return 0u;
 }
 
-bool launcher_available() {
-    return false;
-}
-
 bool dlss_files_present() {
     return false;
 }
@@ -1437,8 +1470,24 @@ VendorLicense vendor_license(std::string&) {
     return VendorLicense::Failed;
 }
 
-bool restart_game(bool) {
-    return false;
+namespace {
+std::atomic<int> restart_request{0};  // restart_wanted: 0 none, 1 a start, 2 a diagnostics run
+}  // namespace
+
+// The game ends as for Quit, and the host starts it again as it leaves (host_main finish_and_exit: an exec of this
+// executable), with --diagnostics 1 for a diagnostics run.
+bool restart_game(bool record) {
+    restart_request.store(record ? 2 : 1, std::memory_order_release);
+    quit_request.store(true, std::memory_order_release);
+    return true;
+}
+
+int restart_wanted() noexcept {
+    return restart_request.load(std::memory_order_acquire);
+}
+
+void quit_game() noexcept {
+    quit_request.store(true, std::memory_order_release);
 }
 
 void* metal_layer(NativeWindow) {

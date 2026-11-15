@@ -108,10 +108,14 @@ struct SettingsMonitor {
 [[nodiscard]] bool window_modal_active() noexcept;
 // The window's inside to that size in pixels, from any thread (an extension's resize_window).
 void resize_window_client(unsigned width, unsigned height) noexcept;
-enum class FilePick { Miis, ModArchives, ModFolders };
+enum class FilePick { Miis, ModArchives, ModFolders, Saves };
 // The platform's file picker; `done` runs off the window's thread with what was chosen. Android picks documents
-// (no folders: ModFolders is not offered there) and hands over copies the game can read by path.
+// (no folders: ModFolders is not offered there) and hands over copies the game can read by path. Saves picks one file.
 void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::path>)> done);
+// The platform's save dialog for a file the game made (an export): the player chooses where it goes, under `file`'s
+// name, and it is copied there. `done` runs off the window's thread.
+enum class SaveCopy { Saved, Cancelled, Failed };
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done);
 // Shows a folder of the game's in the platform's file manager; folders_open is false where none can (Android: the
 // app's own storage is private to it).
 void open_folder(const std::filesystem::path& folder);
@@ -122,7 +126,6 @@ struct UpscalerCaps {
 };
 [[nodiscard]] UpscalerCaps upscaler_caps() noexcept;
 [[nodiscard]] unsigned dlss_min_width(unsigned quality, unsigned width, unsigned height) noexcept;
-[[nodiscard]] bool launcher_available();
 [[nodiscard]] bool dlss_files_present();
 [[nodiscard]] bool xess_files_present();
 [[nodiscard]] bool frame_generation_files_present();
@@ -137,7 +140,14 @@ enum class VendorInstall { Running, Done, Canceled, Failed };
 void fetch_vendor_license(unsigned upscaler);
 enum class VendorLicense { Loading, Ready, Failed };
 [[nodiscard]] VendorLicense vendor_license(std::string& text);
+// Starts the game again once this one has closed (`record`: as a diagnostics run, --diagnostics 1); false where this
+// host cannot.
 [[nodiscard]] bool restart_game(bool record);
+// The start-again restart_game asked for, read by the host as the game ends: 0 none, 1 a start, 2 a diagnostics run
+// (always 0 on Android, where the activity starts the game again).
+[[nodiscard]] int restart_wanted() noexcept;
+// Ends the game as the window's close does (the settings' Update on Windows, once Nebula Setup has started).
+void quit_game() noexcept;
 
 extern std::atomic<bool> ray_tracing_offered;  // the RAY TRACING row is offered
 extern std::atomic<bool> rtx_adapter;          // the session's GPU is an NVIDIA RTX (DLSS)

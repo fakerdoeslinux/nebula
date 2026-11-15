@@ -28,7 +28,7 @@ int main() {
         menu.key(LauncherAction::Back, false);
         check(menu.row == Model::RowSettings && menu.visible, "back on the rows does nothing");
 
-        menu.offer_notice();
+        menu.offer_notice(false);
         check(menu.view() == static_cast<int>(Model::kNoticePage | Model::kLauncherView),
               "a notice shows its page at once");
         menu.key(LauncherAction::Next, false);
@@ -37,7 +37,7 @@ int main() {
         menu.key(LauncherAction::Accept, false);
         check(menu.view() == static_cast<int>(Model::RowSettings | Model::kLauncherView) && menu.notice_held,
               "its answer returns to the rows, the notice still held");
-        menu.offer_notice();
+        menu.offer_notice(false);
         check(!menu.notice_page, "a notice shows its page once");
         check(menu.click(5) == Model::Effect::None && menu.visible, "a click past the rows does nothing");
         menu.click(Model::RowQuit);
@@ -46,7 +46,7 @@ int main() {
               "a closed screen takes no keys");
 
         Model play;
-        play.offer_notice();
+        play.offer_notice(false);
         play.open();
         check(play.notice_page, "a notice found before the screen opens shows first");
         play.key(LauncherAction::Back, false);
@@ -82,7 +82,7 @@ int main() {
 
         Model back;
         back.offer_message();
-        back.offer_notice();
+        back.offer_notice(false);
         back.open();
         check(back.view() == static_cast<int>(Model::kMessagePage | Model::kLauncherView),
               "a benchmark's message shows before a notice");
@@ -100,7 +100,7 @@ int main() {
 
         Model up;
         up.offer_upload();
-        up.offer_notice();
+        up.offer_notice(false);
         up.open();
         check(up.view() == static_cast<int>(Model::kUploadPage | Model::UploadNo | Model::kLauncherView),
               "the upload question shows first, Don't send selected");
@@ -153,6 +153,45 @@ int main() {
         late.upload_finished(true);
         check(late.upload_page == 0u && late.view() == static_cast<int>(Model::kLauncherView),
               "a send's answer after the player left changes nothing");
+
+        // An install that updates itself: the notice's Update and Later.
+        Model update;
+        update.offer_notice(true);
+        update.open();
+        check(update.view() == static_cast<int>(Model::kNoticePage | Model::kNoticeInstall | Model::NoticeUpdate | Model::kLauncherView),
+              "the notice opens on Update");
+        update.key(LauncherAction::Next, false);
+        check(update.view() == static_cast<int>(Model::kNoticePage | Model::kNoticeInstall | Model::NoticeLater | Model::kLauncherView),
+              "Next selects Later");
+        update.key(LauncherAction::Next, false);
+        check(update.notice_answer == Model::NoticeUpdate, "the two answers wrap");
+        check(update.key(LauncherAction::Accept, false) == Model::Effect::None && update.poll() == Model::kChoiceUpdate &&
+                  !update.visible,
+              "Update leaves the home screen with kChoiceUpdate");
+        Model later;
+        later.offer_notice(true);
+        later.open();
+        later.click(Model::NoticeLater);
+        check(later.poll() == -1 && later.view() == static_cast<int>(Model::kLauncherView), "Later goes to the rows");
+        Model backed;
+        backed.offer_notice(true);
+        backed.open();
+        check(backed.key(LauncherAction::Back, false) == Model::Effect::None && backed.poll() == -1 &&
+                  backed.view() == static_cast<int>(Model::kLauncherView),
+              "Back on the notice is Later");
+        Model tells;
+        tells.offer_notice(false);
+        tells.open();
+        check(tells.view() == static_cast<int>(Model::kNoticePage | Model::kLauncherView), "without install: Back only");
+        check(tells.key(LauncherAction::Accept, false) == Model::Effect::None && tells.poll() == -1, "its answer goes back");
+        Model first;
+        first.offer_message();
+        first.offer_notice(true);
+        first.open();
+        check(first.view() == static_cast<int>(Model::kMessagePage | Model::kLauncherView), "the message shows before the notice");
+        first.key(LauncherAction::Accept, false);
+        check(first.view() == static_cast<int>(Model::kNoticePage | Model::kNoticeInstall | Model::kLauncherView),
+              "then the notice with its answers");
     } catch (const std::exception& failure) {
         std::cerr << "launcher_model_tests: " << failure.what() << '\n';
         return 1;

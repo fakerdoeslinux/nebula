@@ -138,6 +138,12 @@ target_link_libraries(galaxy_asset_store PUBLIC galaxy_runtime_abi)
 add_library(galaxy_save_files STATIC runtime/src/save_files.cpp)
 target_link_libraries(galaxy_save_files PUBLIC galaxy_runtime_abi galaxy_atomic_file)
 
+# Save import and export in the game (save_transfer.h): its zips, the Wii SD save's AES and the GameData.bin check are
+# BoringSSL's, zlib's inflate and the game's own SaveFileFormat.hpp.
+add_library(galaxy_save_transfer STATIC runtime/src/save_transfer.cpp)
+target_link_libraries(galaxy_save_transfer PUBLIC galaxy_runtime_abi galaxy_atomic_file nebula_bssl_crypto nebula_zinflate)
+target_include_directories(galaxy_save_transfer PRIVATE native/petari/include)
+
 # The host's extensions (host_extension.h, --extension).
 add_library(galaxy_host_extension STATIC runtime/src/host_extension.cpp runtime/src/luma_services_host.cpp)
 target_link_libraries(galaxy_host_extension PUBLIC galaxy_runtime_abi)
@@ -228,7 +234,12 @@ add_library(galaxy_native_host STATIC
     runtime/src/controller_hid.cpp
     runtime/src/switch2_ble_win.cpp
     runtime/src/wiimote_hid.cpp
-    runtime/src/wiimote_link_win32.cpp)
+    runtime/src/wiimote_link_win32.cpp
+    # The home screen's update check (galaxy/update.h) over WinHTTP; Nebula Setup installs.
+    runtime/src/update/update.cpp
+    runtime/src/update/update_crypto.cpp
+    runtime/src/update/update_transport_winhttp.cpp
+    runtime/src/update/update_install_windows.cpp)
 target_link_libraries(galaxy_native_host
     PUBLIC
         galaxy_runtime_abi
@@ -251,7 +262,7 @@ target_link_libraries(galaxy_native_host
 )
 galaxy_host_options(galaxy_native_host)
 # The host's diagnostics report modes (diag_report.h).
-target_compile_definitions(galaxy_native_host PUBLIC NEBULA_DIAG_REPORTS=1)
+target_compile_definitions(galaxy_native_host PUBLIC NEBULA_DIAG_REPORTS=1 NEBULA_UPDATE_CHECK=1)
 
 # The same passes for the Vulkan renderer, compiled on the device (cmake/post_shader_sources.cmake).
 include(cmake/post_shader_sources.cmake)
@@ -518,6 +529,7 @@ endif()
 target_link_libraries(galaxy_render PRIVATE mfplat mfreadwrite mfuuid d3d11)
 target_link_libraries(galaxy_render
     PUBLIC
+        galaxy_save_transfer
         galaxy_native_host
         galaxy_runtime_abi
         galaxy_runtime_settings
@@ -602,13 +614,14 @@ endfunction()
 
 set(rt runtime/src)
 galaxy_test(galaxy_atomic_file_tests SOURCES ${rt}/atomic_file_tests.cpp LIBS galaxy_atomic_file)
-# The update core of the Linux and macOS hosts (runtime/src/update), with a stand-in transport and platform.
+# The update core of the desktop hosts (runtime/src/update), with a stand-in transport and platform.
 galaxy_test(galaxy_update_tests SOURCES ${rt}/update/update.cpp ${rt}/update/update_crypto.cpp ${rt}/update/update_tests.cpp
     LIBS galaxy_atomic_file shell32 ARGS "${CMAKE_CURRENT_SOURCE_DIR}/installer/release-public-key.xml")
 galaxy_test(galaxy_save_files_tests SOURCES ${rt}/save_files_tests.cpp LIBS galaxy_save_files)
 galaxy_test(galaxy_save_format_tests SOURCES ${rt}/save_format_tests.cpp)
 galaxy_test(galaxy_launch_args_tests SOURCES ${rt}/launch_args_tests.cpp)
 target_include_directories(galaxy_save_format_tests PRIVATE native/petari/include)
+galaxy_test(galaxy_save_transfer_tests SOURCES ${rt}/save_transfer_tests.cpp LIBS galaxy_save_transfer)
 galaxy_test(galaxy_asset_store_tests SOURCES ${rt}/asset_store_tests.cpp ${rt}/luma_game_store.cpp LIBS galaxy_asset_store)
 target_include_directories(galaxy_asset_store_tests PRIVATE crates/nebula-import/include)
 # D-07: an older install's store and saves under the current layout.
@@ -871,6 +884,7 @@ runtime/src/render/host_window_win32.cpp
     target_link_libraries(galaxy_render_vk
         PUBLIC
             nebula_vulkan_deps
+            galaxy_save_transfer
             galaxy_native_host
             galaxy_runtime_abi
             galaxy_runtime_settings
@@ -985,6 +999,7 @@ if(NEBULA_D3D11)
     target_link_libraries(galaxy_render_d3d11
         PUBLIC
             galaxy_asset_store
+            galaxy_save_transfer
             galaxy_native_host
             galaxy_runtime_abi
             galaxy_runtime_settings

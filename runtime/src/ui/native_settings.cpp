@@ -38,6 +38,10 @@
 #include "galaxy/ui/settings_display_page.h"
 #include "galaxy/ui/settings_advanced_page.h"
 #include "galaxy/ui/settings_system_page.h"
+#include "galaxy/save_transfer.h"
+#if defined(NEBULA_UPDATE_CHECK)
+#include "galaxy/update.h"
+#endif
 
 #include <luma_services.h>
 
@@ -2121,6 +2125,133 @@ void open_folder_in_explorer(const std::filesystem::path& folder) {
 
 // Explorer at the Mii import folder (its files join the database at every start).
 void open_mii_folder() { open_folder_in_explorer(galaxy::host::mii_import_folder()); }
+
+// SAVES (GENERAL page): an import is picked, read and checked (save_transfer::plan_import), waits for the player's
+// Replace, is written with the replaced files backed up, and the game starts again to read it. An export is made in
+// the settings folder's .export and copied where the player chooses (host_window::save_copy).
+std::mutex s_saves_mutex;
+std::atomic<ui::SavesStep> s_saves_step{ui::SavesStep::Idle};
+std::shared_ptr<const galaxy::save_transfer::ImportPlan> s_saves_plan;  // under s_saves_mutex: the plan Confirm asks about
+bool s_saves_replace = false;                                            // under s_saves_mutex
+std::string s_saves_import_status;                                       // under s_saves_mutex
+std::string s_saves_export_status;                                       // under s_saves_mutex
+
+const char* saves_import_text(const galaxy::save_transfer::ImportPlan& plan) {
+    using galaxy::save_transfer::Error;
+    if (plan.kind == galaxy::save_transfer::Kind::kDatelSave) return "ACTION REPLAY SAVES CANNOT BE READ";
+    switch (plan.error) {
+    case Error::kNewerVersion: return "THIS SAVE IS FROM A NEWER VERSION OF NEBULA";
+    case Error::kDamaged: return "THIS SAVE IS DAMAGED";
+    case Error::kWrongGame: return "THIS SAVE IS FROM ANOTHER GAME";
+    case Error::kWrongRegion: return "THIS FILE HAS NO SAVE FOR THIS VERSION OF THE GAME";
+    case Error::kTooLarge: return "THIS FILE IS TOO LARGE TO BE A SAVE";
+    case Error::kNoSaves: return "NO SAVE WAS FOUND IN THIS FILE";
+    case Error::kIo: return "THE FILE COULD NOT BE READ";
+    default: return "THIS FILE IS NOT A SAVE NEBULA CAN READ";
+    }
+}
+
+void saves_import_status(std::string text) {
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    s_saves_import_status = std::move(text);
+}
+
+void start_saves_import() {
+    if (!opens_on_desktop("the save picker")) return;
+    ui::SavesStep idle = ui::SavesStep::Idle;
+    if (!s_saves_step.compare_exchange_strong(idle, ui::SavesStep::Choosing, std::memory_order_acq_rel)) return;
+    host_window::pick_files(host_window::FilePick::Saves, [](std::vector<std::filesystem::path> files) {
+        if (files.empty()) {
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        const std::filesystem::path root = galaxy::save_transfer::game_save_root();
+        auto plan = std::make_shared<galaxy::save_transfer::ImportPlan>(
+            galaxy::save_transfer::plan_import(files.front(), galaxy::save_transfer::game_code()));
+        std::cerr << "[settings] save import: " << galaxy::path_text(files.front()) << ": error "
+                  << static_cast<int>(plan->error) << ", " << plan->files.size() << " files\n";
+        const std::lock_guard<std::mutex> lock(s_saves_mutex);
+        if (plan->error != galaxy::save_transfer::Error::kNone) {
+            s_saves_import_status = saves_import_text(*plan);
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        s_saves_replace = galaxy::save_transfer::replaces_saves(*plan, root);
+        s_saves_plan = std::move(plan);
+        s_saves_import_status.clear();
+        s_saves_step.store(ui::SavesStep::Confirm, std::memory_order_release);
+    });
+}
+
+void cancel_saves_import() {
+    ui::SavesStep confirm = ui::SavesStep::Confirm;
+    if (!s_saves_step.compare_exchange_strong(confirm, ui::SavesStep::Idle, std::memory_order_acq_rel)) return;
+    const std::lock_guard<std::mutex> lock(s_saves_mutex);
+    s_saves_plan.reset();
+}
+
+// The player chose Replace: written off the menu's thread, then the game starts again (it reads the save at its start).
+void confirm_saves_import() {
+    ui::SavesStep confirm = ui::SavesStep::Confirm;
+    if (!s_saves_step.compare_exchange_strong(confirm, ui::SavesStep::Importing, std::memory_order_acq_rel)) return;
+    std::shared_ptr<const galaxy::save_transfer::ImportPlan> plan;
+    {
+        const std::lock_guard<std::mutex> lock(s_saves_mutex);
+        plan = std::move(s_saves_plan);
+    }
+    if (!plan) {
+        s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+        return;
+    }
+    std::thread([plan] {
+        const galaxy::save_transfer::ImportResult result =
+            galaxy::save_transfer::commit_import(*plan, galaxy::save_transfer::game_save_root());
+        if (result.error != galaxy::save_transfer::Error::kNone) {
+            std::cerr << "[settings] save import failed: error " << static_cast<int>(result.error) << '\n';
+            saves_import_status("THE SAVE COULD NOT BE WRITTEN. YOUR SAVES ARE UNCHANGED");
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        std::cerr << "[settings] save imported: " << result.written << " files; replaced files in "
+                  << galaxy::path_text(result.backup) << '\n';
+        if (host_window::restart_game(false)) return;  // the step stays Importing until the game closes
+        saves_import_status("SAVE IMPORTED. CLOSE AND REOPEN NEBULA TO PLAY IT");
+        s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+    }).detach();
+}
+
+void start_saves_export() {
+    if (!opens_on_desktop("the save dialog")) return;
+    ui::SavesStep idle = ui::SavesStep::Idle;
+    if (!s_saves_step.compare_exchange_strong(idle, ui::SavesStep::Exporting, std::memory_order_acq_rel)) return;
+    std::thread([] {
+        const std::filesystem::path folder = galaxy::runtime_settings_folder() / ".export";
+        std::error_code error;
+        std::filesystem::remove_all(folder, error);
+        const galaxy::save_transfer::ExportResult made =
+            galaxy::save_transfer::export_saves(galaxy::save_transfer::game_save_root(), folder, NEBULA_VERSION);
+        if (made.error != galaxy::save_transfer::Error::kNone) {
+            {
+                const std::lock_guard<std::mutex> lock(s_saves_mutex);
+                s_saves_export_status = made.error == galaxy::save_transfer::Error::kNoSaves ? "NO SAVES TO EXPORT YET"
+                                                                                             : "THE SAVES COULD NOT BE EXPORTED";
+            }
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+            return;
+        }
+        host_window::save_copy(made.file, [folder](host_window::SaveCopy copied) {
+            {
+                const std::lock_guard<std::mutex> lock(s_saves_mutex);
+                s_saves_export_status = copied == host_window::SaveCopy::Saved    ? "SAVES EXPORTED"
+                                        : copied == host_window::SaveCopy::Failed ? "THE SAVES COULD NOT BE EXPORTED"
+                                                                                  : "";
+            }
+            std::error_code ignored;
+            std::filesystem::remove_all(folder, ignored);
+            s_saves_step.store(ui::SavesStep::Idle, std::memory_order_release);
+        });
+    }).detach();
+}
 
 // The MODS page: the mods folder's mods (galaxy::mods), read when the page first shows and on a rescan (pages are
 // rebuilt for every draw). Which are on, their order and their choices are a draft until Apply saves them to mods.ini
@@ -4448,6 +4579,14 @@ public:
         }
         state.choosing_miis = s_mii_dialog_open.load(std::memory_order_acquire);
         state.folders_open = host_window::folders_open();
+        state.saves_offered = !galaxy::save_transfer::game_save_root().empty() && !galaxy::save_transfer::game_code().empty();
+        state.saves_step = s_saves_step.load(std::memory_order_acquire);
+        {
+            const std::lock_guard<std::mutex> lock(s_saves_mutex);
+            state.saves_replace = s_saves_replace;
+            state.saves_import_status = s_saves_import_status;
+            state.saves_export_status = s_saves_export_status;
+        }
 #if defined(_WIN32)
         state.focus_loss_offered = true;  // the Windows host pauses or mutes a game whose window is not in front (host_main.cpp)
 #endif
@@ -4459,8 +4598,15 @@ public:
         return state;
     }
     void act(ui::GeneralPageAction action) const override {
-        if (action == ui::GeneralPageAction::ImportMiis) start_mii_import_dialog();
-        else if (action == ui::GeneralPageAction::OpenMiiFolder) open_mii_folder();
+        switch (action) {
+        case ui::GeneralPageAction::ImportMiis: start_mii_import_dialog(); break;
+        case ui::GeneralPageAction::OpenMiiFolder: open_mii_folder(); break;
+        case ui::GeneralPageAction::ImportSaves: start_saves_import(); break;
+        case ui::GeneralPageAction::ConfirmImport: confirm_saves_import(); break;
+        case ui::GeneralPageAction::CancelImport: cancel_saves_import(); break;
+        case ui::GeneralPageAction::ExportSaves: start_saves_export(); break;
+        case ui::GeneralPageAction::OpenSaveFolder: open_folder_in_explorer(galaxy::save_transfer::game_save_root()); break;
+        }
     }
 };
 
@@ -4486,8 +4632,71 @@ std::vector<SettingsRow> system_page(const RenderFeatureCaps& caps) {
             timing.passes.emplace_back(times[i].name, times[i].ms);
         }
     }
+    ui::GpuPickerView gpus;
+    gpus.choices = gpu_choices();
+    gpus.next = next_start_gpu();
+    gpus.choose = [](const std::string& identity) { (void)choose_next_start_gpu(identity); };
+#if defined(NEBULA_UPDATE_CHECK)
+    namespace update = galaxy::update;
+    const update::CheckState check = update::check_state();
+    if (check != update::CheckState::Unavailable) {
+        ui::UpdatesView updates;
+        updates.check_at_start = update::check_enabled();
+        updates.toggle = [] { update::set_check_enabled(!update::check_enabled()); };
+        updates.check = [] { (void)update::check_now(NEBULA_VERSION); };
+        updates.can_install = update::can_install();
+#if defined(_WIN32)
+        updates.closes_game = true;
+#endif
+        const std::optional<update::Release> release = update::poll();
+        if (release) updates.version = release->version;
+        const update::InstallProgress install = update::install_progress();
+        switch (install.state) {
+        case update::InstallState::Downloading:
+            updates.step = ui::UpdateStep::Downloading;
+            updates.percent = install.total != 0u ? static_cast<unsigned>(install.bytes * 100u / install.total) : 0u;
+            break;
+        case update::InstallState::Verifying:
+        case update::InstallState::Installing: updates.step = ui::UpdateStep::Installing; break;
+        case update::InstallState::Restart: updates.step = ui::UpdateStep::Restart; break;
+        case update::InstallState::Failed: updates.step = ui::UpdateStep::InstallFailed; break;
+        default:
+            switch (check) {
+            case update::CheckState::Checking: updates.step = ui::UpdateStep::Checking; break;
+            case update::CheckState::UpToDate: updates.step = ui::UpdateStep::UpToDate; break;
+            case update::CheckState::Failed: updates.step = ui::UpdateStep::CheckFailed; break;
+            case update::CheckState::Available: updates.step = ui::UpdateStep::Available; break;
+            default: updates.step = ui::UpdateStep::NotChecked; break;
+            }
+            break;
+        }
+        if (updates.step != ui::UpdateStep::NotChecked && updates.step != ui::UpdateStep::Checking &&
+            updates.step != ui::UpdateStep::UpToDate && updates.step != ui::UpdateStep::CheckFailed && updates.version.empty()) {
+            updates.step = ui::UpdateStep::NotChecked;  // no release in hand (an install's state outlived it)
+        }
+        updates.install = [] {
+            const std::optional<update::Release> offered = update::poll();
+            if (!offered) return;
+#if defined(_WIN32)
+            // Nebula Setup downloads, checks and installs it once the game has closed.
+            if (update::start_setup_update()) {
+                host_window::quit_game();
+            } else {
+                show_controls_message("NEBULA SETUP COULD NOT START");
+            }
+#else
+            if (!update::start_install(*offered)) show_controls_message("THE UPDATE COULD NOT START");
+#endif
+        };
+        updates.restart = [] {
+            if (!host_window::restart_game(false)) show_controls_message("COULD NOT RESTART");
+        };
+        return ui::system_page(caps, post_process_caps_text(get_post_process_status()),
+                               [] { s_diagnostics_ask.store(true, std::memory_order_release); }, &timing, &gpus, &updates);
+    }
+#endif
     return ui::system_page(caps, post_process_caps_text(get_post_process_status()),
-                           [] { s_diagnostics_ask.store(true, std::memory_order_release); }, &timing);
+                           [] { s_diagnostics_ask.store(true, std::memory_order_release); }, &timing, &gpus);
 }
 
 std::vector<SettingsRow> settings_page(unsigned tab, const RenderConfig& draft, const RuntimeSettings& runtime,
@@ -5339,7 +5548,7 @@ NativeSettingsView build_native_settings_view() {
                 shown.label.resize(colon);
             }
         }
-        shown.name = shown.name || (tab == 0u && shown.label == "MONITOR") || (tab == 6u && shown.label == "GRAPHICS CARD") ||
+        shown.name = shown.name || (tab == 0u && shown.label == "MONITOR") ||
                      (tab == 4u && (shown.label == "GALAXY" || shown.label == "STAR"));
         if (tab == kControlsTab) {
             // The controller being set up by its own name (the overlay's row has it in capitals), and the bindings as
@@ -5610,20 +5819,24 @@ bool native_settings_wheel(int delta) {
 }
 
 // Dropped files: mod archives and folders into the mods folder (the MODS page opens on the import), anything else to
-// the Mii import.
+// the Mii import. A nebula:// link (the system's Open with a link, --import) opens the MODS page: importing by link
+// waits on net.internet.
 void native_settings_files_dropped(std::vector<std::filesystem::path> files) {
     std::vector<std::filesystem::path> mods;
     std::vector<std::filesystem::path> miis;
+    bool link = false;
     for (std::filesystem::path& path : files) {
         std::error_code error;
-        if (std::filesystem::is_directory(path, error) || galaxy::mods::is_mod_archive(path)) {
+        if (galaxy::path_text(path).rfind("nebula:", 0) == 0) {
+            link = true;
+        } else if (std::filesystem::is_directory(path, error) || galaxy::mods::is_mod_archive(path)) {
             mods.push_back(std::move(path));
         } else {
             miis.push_back(std::move(path));
         }
     }
-    if (!mods.empty()) {
-        run_mod_imports(std::move(mods));
+    if (!mods.empty() || link) {
+        if (!mods.empty()) run_mod_imports(std::move(mods));
         const std::lock_guard<std::recursive_mutex> lock(s_native_settings_mutex);
         s_native_settings_tab.store(kModsTab, std::memory_order_relaxed);
         s_native_settings_row.store(1u, std::memory_order_relaxed);
