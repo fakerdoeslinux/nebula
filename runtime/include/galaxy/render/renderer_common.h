@@ -22,6 +22,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+struct IDXGIAdapter;  // dxgi.h
+#endif
+
 namespace galaxy::render {
 
 using ScreenProbe = ::NebulaScreenProbe;
@@ -184,6 +188,11 @@ private:
     // Sleeps until a target `remaining_ms` away.
     void sleep_before(double remaining_ms);
 };
+
+#if defined(_WIN32)
+// The adapter's user-mode driver version as Windows shows it ("32.0.15.6094"); empty when it does not say.
+[[nodiscard]] std::string dxgi_driver_version(::IDXGIAdapter* adapter);
+#endif
 
 // A test capture's pixels (RGB rows, top first) as a binary PPM at `path`, written off the render thread (the Vulkan
 // and Metal renderers; Direct3D 12 keeps its own writers). wait_picture_files returns once every one asked is written:

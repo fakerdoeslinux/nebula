@@ -453,44 +453,8 @@ bool input_message_injected() noexcept {
     return GetCurrentInputMessageSource(&source) && source.originId == IMO_INJECTED;
 }
 
-std::wstring launcher_path() {
-    std::wstring launcher = ::galaxy::windows::executable_path();
-    if (launcher.empty()) {
-        return {};
-    }
-    const std::size_t slash = launcher.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
-        return {};
-    }
-    launcher.resize(slash + 1u);
-    launcher += L"NebulaLauncher.exe";
-    return GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES ? std::wstring{} : launcher;
-}
-
-bool start_launcher(const std::wstring& arguments, HANDLE* process_out) {
-    const std::wstring launcher = launcher_path();
-    if (launcher.empty()) {
-        return false;
-    }
-    std::wstring command = L"\"" + launcher + L"\" " + arguments;
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    if (!CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, FALSE, 0u, nullptr, nullptr,
-                        &startup, &process)) {
-        std::cerr << "[launcher] could not start NebulaLauncher.exe: win32=" << GetLastError() << '\n';
-        return false;
-    }
-    // Its window comes to the front over the game.
-    AllowSetForegroundWindow(process.dwProcessId);
-    CloseHandle(process.hThread);
-    if (process_out != nullptr) {
-        *process_out = process.hProcess;
-    } else {
-        CloseHandle(process.hProcess);
-    }
-    return true;
-}
+// restart_game's request (restart_wanted): 0 none, else a Restart's value.
+std::atomic<int> restart_request{0};
 
 
 }  // namespace
@@ -621,8 +585,8 @@ OpenedWindow open_game_window(WindowOwner& owner, int window_width, int window_h
         settings_window.store(
             reinterpret_cast<std::uintptr_t>(opened.window), std::memory_order_release);
         // Files the game was started to import (Open with, --import): as a drop on the window.
-        if (!::galaxy::launch_args().imports.empty()) {
-            native_settings_files_dropped(::galaxy::launch_args().imports);
+        if (std::vector<std::filesystem::path> imports = native_settings_take_launch_imports(); !imports.empty()) {
+            native_settings_files_dropped(std::move(imports));
         }
         // LumaCore's clipboard and links on Windows (services-system 5, 6).
         galaxy::luma_system::set_platform(galaxy::luma_system::win32_platform());
@@ -1548,6 +1512,14 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
             } else if (kind == FilePick::ModFolders) {
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST;
                 dialog->SetTitle(L"Import mod folders");
+            } else if (kind == FilePick::Saves) {
+                const COMDLG_FILTERSPEC filters[] = {
+                    {L"Saves (zip, Nebula.sav, GameData.bin, Wii SD data.bin)", L"*.zip;*.sav;*.bin"},
+                    {L"All files", L"*.*"}};
+                dialog->SetFileTypes(2u, filters);
+                dialog->SetTitle(L"Import saves");
+                options &= ~static_cast<DWORD>(FOS_ALLOWMULTISELECT);
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
             } else {
                 const COMDLG_FILTERSPEC filters[] = {
                     {L"Mods and texture packs (luma, zip, 7z, rar, tar)",
@@ -1581,6 +1553,46 @@ void pick_files(FilePick kind, std::function<void(std::vector<std::filesystem::p
             CoUninitialize();
         }
         done(std::move(files));
+    }).detach();
+}
+
+// The save dialog on its own thread, as the picker; the file is copied where the player chose.
+void save_copy(const std::filesystem::path& file, std::function<void(SaveCopy)> done) {
+    const HWND owner = reinterpret_cast<HWND>(settings_window.load(std::memory_order_acquire));
+    std::thread([owner, file, done = std::move(done)] {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        SaveCopy result = SaveCopy::Failed;
+        IFileSaveDialog* dialog = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+            const COMDLG_FILTERSPEC filters[] = {{L"Zip archive", L"*.zip"}};
+            dialog->SetFileTypes(1u, filters);
+            dialog->SetDefaultExtension(L"zip");
+            dialog->SetFileName(file.filename().c_str());
+            dialog->SetTitle(L"Export saves");
+            DWORD options = 0u;
+            dialog->GetOptions(&options);
+            dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST);
+            IShellItem* item = nullptr;
+            const HRESULT shown = dialog->Show(owner);
+            if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+                result = SaveCopy::Cancelled;
+            } else if (SUCCEEDED(shown) && SUCCEEDED(dialog->GetResult(&item))) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                    std::error_code error;
+                    std::filesystem::copy_file(file, std::filesystem::path(path),
+                                               std::filesystem::copy_options::overwrite_existing, error);
+                    result = error ? SaveCopy::Failed : SaveCopy::Saved;
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+            dialog->Release();
+        }
+        if (SUCCEEDED(com)) {
+            CoUninitialize();
+        }
+        done(result);
     }).detach();
 }
 
@@ -1623,10 +1635,6 @@ UpscalerCaps upscaler_caps() noexcept {
 
 unsigned dlss_min_width(unsigned quality, unsigned width, unsigned height) noexcept {
     return dlss_min_render_width(quality, width, height);
-}
-
-bool launcher_available() {
-    return !launcher_path().empty();
 }
 
 bool dlss_files_present() {
@@ -1709,14 +1717,32 @@ VendorLicense vendor_license(std::string& text) {
     return VendorLicense::Ready;
 }
 
-// The launcher starts the game again once this process has exited (`record`: a diagnostics run); this one closes.
-bool restart_game(bool record) {
-    if (!start_launcher(L"--restart-after " + std::to_wstring(GetCurrentProcessId()) + (record ? L" --record" : L""),
-                        nullptr)) {
+// The window closes, and the host starts the game again as it ends (host_main finish_and_exit: a new process that takes
+// over this one's files, --start-again-of), with the arguments of the start `kind` asks for.
+bool restart_game(Restart kind) {
+    const HWND window = reinterpret_cast<HWND>(settings_window.load(std::memory_order_acquire));
+    if (window == nullptr) {
         return false;
     }
-    PostMessageW(reinterpret_cast<HWND>(settings_window.load(std::memory_order_acquire)), WM_CLOSE, 0, 0);
+    restart_request.store(static_cast<int>(kind), std::memory_order_release);
+    PostMessageW(window, WM_CLOSE, 0, 0);
     return true;
+}
+
+int restart_wanted() noexcept {
+    return restart_request.load(std::memory_order_acquire);
+}
+
+bool can_restart() noexcept {
+    return true;
+}
+
+void quit_game() noexcept {
+    if (const HWND window = reinterpret_cast<HWND>(settings_window.load(std::memory_order_acquire)); window != nullptr) {
+        PostMessageW(window, WM_CLOSE, 0, 0);
+    } else {
+        quit_request.store(true, std::memory_order_release);
+    }
 }
 
 }  // namespace host_window

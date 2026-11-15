@@ -5,6 +5,7 @@
 
 #include "galaxy/content_viewport.h"
 #include "galaxy/experimental_ultrawide_aspect.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/platform_time.h"
 #include "galaxy/render/host_window_win32.h"
@@ -225,7 +226,11 @@ void RendererD3D11::report_adapter() {
     const std::string& name = context.device_name();
     const unsigned vendor = context.caps().vendor;
     host_window::rtx_adapter.store(false, std::memory_order_relaxed);
-    record_render_adapter(name.c_str(), vendor, 0u, 0u, false);
+    DXGI_ADAPTER_DESC1 desc{};
+    IDXGIAdapter1* const adapter = context.adapter();
+    const bool described = adapter != nullptr && SUCCEEDED(adapter->GetDesc1(&desc));
+    record_render_adapter(name.c_str(), vendor, described ? desc.DeviceId : 0u, described ? desc.SubSysId : 0u, false);
+    record_render_driver(dxgi_driver_version(adapter));
     RenderFeatureCaps caps{};
     caps.adapter_vendor_id = vendor;
     std::snprintf(caps.adapter_description.data(), caps.adapter_description.size(), "%s", name.c_str());
@@ -819,6 +824,7 @@ void RendererD3D11::read_pass_times(Frame& frame, UINT64 frequency, UINT64 frame
             pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
         }
     }
+    galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
 }
 
 std::size_t RendererD3D11::gpu_pass_times(GpuPassTime* out, std::size_t capacity) const noexcept {
