@@ -92,8 +92,9 @@ void set_state_wake(void* event) noexcept;
 void native_settings_present();
 // Opens the settings menu on that page (a tab's number), its first row chosen.
 void open_native_settings(unsigned page);
-// The same, with `draft` as its unapplied settings (kept inside what the display allows): Apply keeps them.
-void open_native_settings_draft(unsigned page, const RenderConfig& draft);
+// The settings menu on SYSTEM with the benchmark's results window for `result` (a result file, or the results folder
+// for its newest): the start after a benchmark.
+void open_native_settings_results(const std::filesystem::path& result);
 
 // What the settings menu (runtime/src/ui/native_settings.cpp) asks of its platform.
 struct SettingsMonitor {
@@ -140,12 +141,20 @@ enum class VendorInstall { Running, Done, Canceled, Failed };
 void fetch_vendor_license(unsigned upscaler);
 enum class VendorLicense { Loading, Ready, Failed };
 [[nodiscard]] VendorLicense vendor_license(std::string& text);
-// Starts the game again once this one has closed (`record`: as a diagnostics run, --diagnostics 1); false where this
-// host cannot.
-[[nodiscard]] bool restart_game(bool record);
-// The start-again restart_game asked for, read by the host as the game ends: 0 none, 1 a start, 2 a diagnostics run
-// (always 0 on Android, where the activity starts the game again).
+// What a start-again starts: the game as usual, a diagnostics run (--diagnostics 1), the benchmark (--benchmark 1
+// --benchmark-return 1), or the start after the benchmark, its result open (--benchmark-result).
+enum class Restart : int { Start = 1, Diagnostics = 2, Benchmark = 3, Results = 4 };
+// Ends the game as Quit does and starts it again once it has closed; false where this host cannot (can_restart).
+[[nodiscard]] bool restart_game(Restart kind);
+// The start-again restart_game asked for, read by the host as the game ends: 0 none, else a Restart's value.
 [[nodiscard]] int restart_wanted() noexcept;
+// This host can start the game again (not iOS, where an app cannot start itself).
+[[nodiscard]] bool can_restart() noexcept;
+#if defined(__ANDROID__)
+// The activity starts the game again in a new process (GameActivity.restartGame) and ends this one: the host's last
+// step (host_main finish_and_exit), once the saves are written.
+void start_again(Restart kind);
+#endif
 // Ends the game as the window's close does (the settings' Update on Windows, once Nebula Setup has started).
 void quit_game() noexcept;
 

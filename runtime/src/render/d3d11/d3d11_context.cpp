@@ -4,6 +4,7 @@
 #include "galaxy/render/d3d11/d3d11_context.h"
 
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -129,22 +130,23 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
         if (FAILED(hr)) {
             continue;
         }
-        if (level < kMinimumFeatureLevel) {
-            refused = name + ": feature level " + level_name(level) + ", 11_0 needed";
-            std::cout << "[gpu] passed over " << refused << '\n';
-            continue;
-        }
+        // What the renderer needs (d3d11_refusal: feature level 11_0, the 11.1 interfaces, constant buffers bound at an
+        // offset and written in part, as the draws' rows live in shared buffers); the renderer check judges every card
+        // by the same rule.
+        D3D11Facts facts;
+        facts.device = true;
+        facts.feature_level = static_cast<unsigned>(level);
         ComPtr<ID3D11Device1> device1;
         ComPtr<ID3D11DeviceContext1> context1;
-        if (FAILED(device.As(&device1)) || FAILED(context.As(&context1))) {
-            refused = name + ": no Direct3D 11.1 runtime";
-            continue;
-        }
-        // Constant buffers bound at an offset and written in part: the draws' rows live in shared buffers.
+        facts.device1 = SUCCEEDED(device.As(&device1)) && SUCCEEDED(context.As(&context1));
         D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
-        if (FAILED(device1->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options))) ||
-            !options.ConstantBufferOffsetting || !options.ConstantBufferPartialUpdate) {
-            refused = name + ": no constant buffer offsets";
+        facts.constant_buffer_offsets =
+            facts.device1 && SUCCEEDED(device1->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options))) &&
+            options.ConstantBufferOffsetting && options.ConstantBufferPartialUpdate;
+        if (const RendererRefusal refusal = d3d11_refusal(facts); refusal != RendererRefusal::kNone) {
+            refused = name + ": " + (refusal == RendererRefusal::kFeatureLevel
+                                         ? "feature level " + std::string(level_name(level)) + ", 11_0 needed"
+                                         : std::string(refusal_reason(refusal)));
             std::cout << "[gpu] passed over " << refused << '\n';
             continue;
         }
@@ -165,6 +167,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool debug_layer) {
         break;
     }
     if (device_ == nullptr) {
+        note_no_device();
         failure_ = refused.empty() ? "No hardware Direct3D 11 adapter supports feature level 11_0"
                                    : "No hardware Direct3D 11 adapter can run the renderer (" + refused + ")";
         factory_.Reset();

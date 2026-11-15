@@ -20,3 +20,5 @@
 *.gxdump
 # The developer's diagnostics endpoint and public key (runtime/include/galaxy/diag_endpoint.h).
 runtime/include/galaxy/diag_endpoint_local.h
+# Wrangler's local state (tools/telemetry/worker): the account it signed in with, its cache.
+.wrangler/

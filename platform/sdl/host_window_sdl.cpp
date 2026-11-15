@@ -3,6 +3,7 @@
 // the SDL window and its Vulkan surface; its events (size, focus, quit, the finger and the mouse as the pointer, keys,
 // gamepads); on Android the activity's touch controls and HOME Menu through JNI.
 
+#include "galaxy/benchmark.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/switch_controller.h"
 #include "galaxy/playstation_controller.h"
@@ -142,7 +143,6 @@ std::atomic<std::uint32_t> g_rumble_level{0};
 std::uint32_t g_rumble_sent_pad = 0;
 std::uint32_t g_rumble_sent_level = 0;
 std::uint64_t g_rumble_sent_ms = 0;
-bool g_imports_given = false;  // --import's files handed to the window (the pump's thread)
 
 // A finger's travel on a pointer screen, in pixels, not yet turned into the wheel's steps. Guarded by g_input_mutex.
 float g_menu_swipe_px = 0.0f;
@@ -1135,9 +1135,8 @@ void pump_events(int timeout_ms) noexcept {
     // What the system opened Nebula with (--import; the desktop entry's %u), at the first pump: a
     // file goes where a drop goes, as on Windows (host_window_win32.cpp); a nebula:// link too, which opens the MODS
     // page (native_settings_files_dropped).
-    if (!g_imports_given) {
-        g_imports_given = true;
-        for (const std::filesystem::path& opened : galaxy::launch_args().imports) dropped.push_back(opened);
+    for (std::filesystem::path& opened : galaxy::render::native_settings_take_launch_imports()) {
+        dropped.push_back(std::move(opened));
     }
 #endif
     bool luma_display = false;  // LumaCore's display snapshot changes (services-system 4), read after the events
@@ -1287,8 +1286,8 @@ void pump_events(int timeout_ms) noexcept {
             close_gamepad(event.gdevice.which);
             break;
 #if !defined(__ANDROID__)
-        // Files dropped on the window: mods to the importer, Mii files to the Mii import (native_settings_files_dropped,
-        // after the input lock). Android's launcher takes files there ("Open with", share, drag and drop).
+        // Files dropped on the window: a save to the save import, mods to the importer, Mii files to the Mii import
+        // (native_settings_files_dropped, after the input lock). Android's launcher takes files there ("Open with", share, drag and drop).
         case SDL_EVENT_DROP_FILE:
             if (event.drop.data != nullptr) {
                 dropped.emplace_back(galaxy::text_path(event.drop.data));
@@ -1320,7 +1319,7 @@ void pump_events(int timeout_ms) noexcept {
             const galaxy::input::NativeSettingsPadStep step = galaxy::input::native_settings_pad_step(
                 g_menu_pad, buttons, sample.axes[0], sample.axes[1],
                 galaxy::render::native_settings_overlay_visible() || galaxy::render::home_menu_visible() ||
-                    galaxy::ui::launcher_visible(), galaxy::steady_ms());
+                    galaxy::ui::launcher_visible() || galaxy::bench::running(), galaxy::steady_ms());
             for (std::size_t i = 0; i < step.key_count; ++i) {
                 galaxy::render::native_settings_post_key(step.keys[i]);
             }
@@ -1953,33 +1952,28 @@ void quit_game() noexcept {
     quit_request.store(true, std::memory_order_release);
 }
 
-#if defined(__ANDROID__)
-bool restart_game(bool) {
-    galaxy::sdl::call_activity("restartGame");
-    return true;
-}
-
-int restart_wanted() noexcept {
-    return 0;
-}
-#elif defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(__APPLE__) && TARGET_OS_IPHONE
 // An iOS app cannot start itself again (host_main kHostStartsAgain).
-bool restart_game(bool) {
+bool restart_game(Restart) {
     return false;
 }
 
 int restart_wanted() noexcept {
     return 0;
 }
+
+bool can_restart() noexcept {
+    return false;
+}
 #else
 namespace {
-std::atomic<int> restart_request{0};  // restart_wanted: 0 none, 1 a start, 2 a diagnostics run
+std::atomic<int> restart_request{0};  // restart_wanted: 0 none, else a Restart's value
 }  // namespace
 
 // The game ends as for Quit, and the host starts it again as it leaves (host_main finish_and_exit: an exec of this
-// executable), with --diagnostics 1 for a diagnostics run.
-bool restart_game(bool record) {
-    restart_request.store(record ? 2 : 1, std::memory_order_release);
+// executable with the arguments of the start `kind` asks for; on Android the activity's new process, start_again).
+bool restart_game(Restart kind) {
+    restart_request.store(static_cast<int>(kind), std::memory_order_release);
     quit_request.store(true, std::memory_order_release);
     return true;
 }
@@ -1987,6 +1981,16 @@ bool restart_game(bool record) {
 int restart_wanted() noexcept {
     return restart_request.load(std::memory_order_acquire);
 }
+
+bool can_restart() noexcept {
+    return true;
+}
+
+#if defined(__ANDROID__)
+void start_again(Restart kind) {
+    galaxy::sdl::call_activity(galaxy::sdl::ActivityCall{"restartGame", true, static_cast<int>(kind)});
+}
+#endif
 #endif
 
 #if defined(NEBULA_GPU_METAL)

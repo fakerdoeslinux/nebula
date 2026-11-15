@@ -2,11 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string_view>
-
-namespace galaxy::render {
-struct RenderConfig;
-}
 
 // Launcher mode (docs/using-nebula/command-line-arguments.md `--home`): the boot holds the title on a home screen (Play, Settings, Benchmark,
 // Quit, and an update's notice when one is offered) in the menus' own look. The host keeps it (launcher_model.h: its keys and
@@ -18,17 +15,9 @@ namespace galaxy::ui {
 void launcher_enable(bool on) noexcept;
 // Before the game starts: whether the rows offer the benchmark (the host can start itself again with it).
 void launcher_offer_benchmark(bool on) noexcept;
-// Before the game starts: settings the settings menu shows as its unapplied draft when the home screen opens (a
-// benchmark's recommendation, --benchmark-result); its Apply keeps them.
-void launcher_show_draft(const galaxy::render::RenderConfig& draft);
-// Before the game starts: the benchmark this start returned from gave no recommendation; the home screen says so once.
-void launcher_offer_message() noexcept;
-// Before the game starts: the benchmark's result may be sent (the host checked the build's endpoint, the result's
-// status and that it was not sent). The question shows once, Don't send selected; `act` is called on the window's
-// thread with 0 (show the full report) or 1 (send it, once; the host answers with launcher_upload_finished). The
-// recommendation's draft opens when the question is left.
-void launcher_offer_upload(void (*act)(int what)) noexcept;
-void launcher_upload_finished(bool sent) noexcept;
+// Before the game starts: the benchmark this start returned from (--benchmark-result: its result file, or the results
+// folder for its newest). The settings menu opens on its results window at the title's hold, once, home screen or not.
+void launcher_show_results(const std::filesystem::path& result);
 // The game's request at the title's hold: true once, when launcher mode is on.
 [[nodiscard]] bool launcher_open() noexcept;
 [[nodiscard]] bool launcher_visible() noexcept;

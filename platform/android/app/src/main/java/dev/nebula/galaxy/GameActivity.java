@@ -97,6 +97,10 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
     // The settings' Import (pickFiles) and Export (saveCopy): request codes of their own beside SDL's.
     private static final int PICK_FILES_REQUEST = 0x4E42;
     private static final int SAVE_COPY_REQUEST = 0x4E43;
+
+    // A start the game asked for (restartGame): the benchmark, or the start after it that shows its result.
+    private static final String EXTRA_BENCHMARK = "nebula.benchmark";
+    private static final String EXTRA_BENCHMARK_RESULT = "nebula.benchmark_result";
     private int pickKind;
     private File saveCopyFile;
 
@@ -142,24 +146,13 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
         if (harness != null) {
             return harness;
         }
-        // The launcher's Record diagnostics: this run only.
+        // The settings menu's Run benchmark (restartGame): this start runs it, then the game starts again with its result.
+        final boolean benchmark = getIntent().getBooleanExtra(EXTRA_BENCHMARK, false) && !isProfileRun();
+        // Record diagnostics (the launcher's, or the game's restart for it): the next normal run only.
         final SharedPreferences prefs = GameFiles.controls(this);
-        final boolean record = isProfileRun() || prefs.getBoolean(GameFiles.RECORD_NEXT_RUN, false);
+        final boolean record = isProfileRun() || (!benchmark && prefs.getBoolean(GameFiles.RECORD_NEXT_RUN, false));
         if (record && !isProfileRun()) {
             prefs.edit().remove(GameFiles.RECORD_NEXT_RUN).commit();
-        }
-        // The launcher's Benchmark (Benchmark.kt, perf/bench's contract): no saves, the result file in their place;
-        // the game shows its steps and exits by itself.
-        if (getIntent().getBooleanExtra(Benchmark.EXTRA, false) && !isProfileRun()) {
-            final List<String> bench = new ArrayList<>(Arrays.asList(
-                "--data", nativeData().getPath(),
-                "--pak", GameFiles.pak(this).getPath(),
-                "--module", getApplicationInfo().nativeLibraryDir + "/libsmg_game.so",
-                "--diagnostics", "0",
-                "--benchmark", "1",
-                "--benchmark-out", Benchmark.INSTANCE.resultFile(this).getPath()));
-            addDriver(bench);
-            return bench.toArray(new String[0]);
         }
         // The native game's settings, saves and log: the app's private storage. The mods that come with the app are
         // installed by the game from where they were unpacked.
@@ -173,6 +166,13 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
         if (shipped != null) {
             args.add("--shipped-mods");
             args.add(shipped.getPath());
+        }
+        if (benchmark) {
+            // No saves are read or written while it runs (the game keeps a blank one in memory); it ends by itself.
+            args.addAll(Arrays.asList("--benchmark", "1", "--benchmark-return", "1"));
+        } else if (getIntent().getBooleanExtra(EXTRA_BENCHMARK_RESULT, false)) {
+            // Back from the benchmark: the settings menu opens on its newest result (the results folder's newest).
+            args.addAll(Arrays.asList("--benchmark-result", new File(new File(nativeData(), "diagnostics"), "benchmarks").getPath()));
         }
         addDriver(args);
         return args.toArray(new String[0]);
@@ -706,11 +706,21 @@ public class GameActivity extends SDLActivity implements SensorEventListener {
         file.delete();
     }
 
-    // Called by libmain.so: the game starts again, straight back into the game (on SDL's thread). One game per process, so
-    // a new process takes over this one's task.
-    public void restartGame() {
+    // Called by libmain.so (host_window.h Restart, on SDL's thread): the game starts again, straight back into the game, as
+    // `kind` asks: 1 a normal start, 2 one that records diagnostics, 3 the benchmark, 4 the start after the benchmark,
+    // with its result. One game per process, so a new process takes over this one's task.
+    public void restartGame(int kind) {
         runOnUiThread(() -> {
             final Intent intent = new Intent(getIntent());
+            intent.removeExtra(EXTRA_BENCHMARK);
+            intent.removeExtra(EXTRA_BENCHMARK_RESULT);
+            if (kind == 2) {
+                GameFiles.controls(this).edit().putBoolean(GameFiles.RECORD_NEXT_RUN, true).commit();
+            } else if (kind == 3) {
+                intent.putExtra(EXTRA_BENCHMARK, true);
+            } else if (kind == 4) {
+                intent.putExtra(EXTRA_BENCHMARK_RESULT, true);
+            }
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
             startActivity(intent);
             overridePendingTransition(0, 0);

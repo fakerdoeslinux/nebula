@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "galaxy/ui/settings_system_page.h"
+
+#include "galaxy/ui/gpu_pass_label.h"
+
+#include <algorithm>
 #include <cstdio>
+#include <utility>
 
 namespace galaxy::ui {
 namespace {
@@ -8,9 +13,133 @@ const char* exposed_text(const render::RenderFeatureStatus& status) {
     return status.settings_exposed ? "READY" : "HIDDEN";
 }
 
+const char* renderer_text(render::RendererKind kind) {
+    switch (kind) {
+    case render::RendererKind::kD3D12: return "DIRECT3D 12";
+    case render::RendererKind::kD3D11: return "DIRECT3D 11";
+    case render::RendererKind::kVulkan: return "VULKAN";
+    case render::RendererKind::kMetal: return "METAL";
+    default: return "AUTO";
+    }
+}
+
+// Why the card does not run a renderer; nothing where it does or it is not known.
+const char* refusal_text(render::RendererRefusal refusal) {
+    using render::RendererRefusal;
+    switch (refusal) {
+    case RendererRefusal::kNotInstalled: return "NOT INSTALLED";
+    case RendererRefusal::kNoDriver: return "NO DRIVER IS INSTALLED";
+    case RendererRefusal::kNoDevice: return "NOT SUPPORTED BY THE CARD'S DRIVER";
+    case RendererRefusal::kFeatureLevel: return "NEEDS FEATURE LEVEL 11.0";
+    case RendererRefusal::kBindingTier: return "NEEDS RESOURCE BINDING TIER 2";
+    case RendererRefusal::kShaderModel: return "NEEDS SHADER MODEL 6.0";
+    case RendererRefusal::kNoD3D11_1: return "NEEDS THE DIRECT3D 11.1 RUNTIME";
+    case RendererRefusal::kConstantBufferOffsets: return "NEEDS CONSTANT BUFFER OFFSETS";
+    case RendererRefusal::kVulkanVersion: return "NEEDS VULKAN 1.1";
+    case RendererRefusal::kNoSwapchain:
+    case RendererRefusal::kNoPresentQueue: return "CANNOT SHOW PICTURES IN A WINDOW";
+    default: return nullptr;
+    }
+}
+
+// The renderers the row offers: those the card runs, or that are not known not to.
+std::vector<render::RendererKind> offered_renderers(const RendererPickerView& view) {
+    std::vector<render::RendererKind> offered;
+    for (const render::RendererKind kind : render::kRendererPreference) {
+        if (refusal_text(view.card.refusal(kind)) == nullptr) offered.push_back(kind);
+    }
+    return offered;
+}
+
+// The RENDERER row (RendererPickerView): the renderers the card runs to choose from, those it does not named with
+// their reason in the help.
+void renderer_rows(std::vector<SettingsRow>& rows, const RendererPickerView& view) {
+    if (!view.choose) {
+        rows.push_back({"RENDERER", renderer_text(view.running), nullptr, {}});
+        return;
+    }
+    if (!view.checked) {
+        rows.push_back({"RENDERER", "CHECKING", nullptr, "CHANGES APPLY AT THE NEXT START"});
+        return;
+    }
+    std::string help;
+    for (const render::RendererKind kind : render::kRendererPreference) {
+        if (const char* const reason = refusal_text(view.card.refusal(kind)); reason != nullptr) {
+            help += std::string(renderer_text(kind)) + ": " + reason + ". ";
+        }
+    }
+    help += "CHANGES APPLY AT THE NEXT START";
+    const std::vector<render::RendererKind> offered = offered_renderers(view);
+    const render::RendererKind shown = shown_renderer(view);
+    if (offered.size() < 2u) {
+        rows.push_back({"RENDERER", renderer_text(shown), nullptr, help});
+        return;
+    }
+    const auto at = static_cast<unsigned>(std::find(offered.begin(), offered.end(), shown) - offered.begin());
+    const std::function<void(render::RendererKind)> choose = view.choose;
+    rows.push_back({"RENDERER", renderer_text(shown),
+                    [offered, choose, at](RenderConfig&, int delta) {
+                        const unsigned next = settings_step(at, static_cast<unsigned>(offered.size()), delta);
+                        if (next != at) choose(offered[next]);
+                    },
+                    help});
+}
+
 }  // namespace
+
+render::RendererKind shown_renderer(const RendererPickerView& view) {
+    if (!view.choose || !view.checked) return view.running;
+    const std::vector<render::RendererKind> offered = offered_renderers(view);
+    if (offered.empty()) return view.running;
+    return std::find(offered.begin(), offered.end(), view.next) != offered.end() ? view.next : offered.front();
+}
+// The BENCHMARK section (BenchmarkView).
+void benchmark_rows(std::vector<SettingsRow>& rows, const BenchmarkView& view) {
+    if (!view.can_run && !view.has_result) return;  // where the game cannot start itself again (iOS) there is none
+    rows.push_back({"BENCHMARK", {}, nullptr, {}, true});
+    if (view.can_run) {
+        const std::function<void()> run = view.run;
+        rows.push_back(button_row("RUN BENCHMARK", {"RUN"}, [run](RenderConfig&, unsigned) { if (run) run(); },
+                                  "MEASURES THIS DEVICE ON 5 STAGES. THE GAME RESTARTS FOR IT"));
+    }
+    if (!view.has_result) {
+        rows.push_back({"LAST RESULT", "NONE", nullptr, "RUN THE BENCHMARK TO SEE HOW THIS DEVICE RUNS THE GAME"});
+        return;
+    }
+    const std::function<void()> show = view.view;
+    std::string seen = view.last_outcome;
+    if (!view.last_when.empty()) seen = view.last_when + ": " + seen;
+    rows.push_back(button_row("LAST RESULT", {"VIEW"}, [show](RenderConfig&, unsigned) { if (show) show(); }, seen));
+
+    const std::function<void()> recommend = view.recommend;
+    const bool offered = view.apply == BenchmarkApply::Offer;
+    const char* const apply_help = view.apply == BenchmarkApply::Offer    ? "THE SETTINGS THE BENCHMARK RECOMMENDS, AS CHANGES TO APPLY"
+                                   : view.apply == BenchmarkApply::InUse  ? "THE RECOMMENDED SETTINGS ARE IN USE"
+                                   : view.apply == BenchmarkApply::OtherGpu ? "THE LAST RESULT IS FROM ANOTHER GRAPHICS CARD"
+                                                                          : "THE LAST RUN DID NOT FINISH";
+    rows.push_back(button_row("APPLY RECOMMENDED", {offered ? "APPLY" : "-APPLY"},
+                              [recommend, offered](RenderConfig&, unsigned) { if (offered && recommend) recommend(); },
+                              apply_help));
+
+    const std::function<void()> send = view.send_report;
+    switch (view.send) {
+    case BenchmarkSend::Hidden: break;
+    case BenchmarkSend::Offer:
+        rows.push_back(button_row("SEND TO DEVELOPER", {"SEND"}, [send](RenderConfig&, unsigned) { if (send) send(); },
+                                  "SENDS THE LAST RESULT ONCE, TO HELP NEBULA RUN WELL ON DEVICES LIKE THIS ONE"));
+        break;
+    case BenchmarkSend::Sending: rows.push_back({"SEND TO DEVELOPER", "SENDING", nullptr, {}}); break;
+    case BenchmarkSend::Sent: rows.push_back({"SEND TO DEVELOPER", "SENT", nullptr, "THANK YOU"}); break;
+    case BenchmarkSend::Failed:
+        rows.push_back(button_row("SEND TO DEVELOPER", {"TRY AGAIN"}, [send](RenderConfig&, unsigned) { if (send) send(); },
+                                  "THE REPORT COULD NOT BE SENT. IT IS KEPT ON THIS DEVICE"));
+        break;
+    }
+}
+
 std::vector<SettingsRow> system_page(const render::RenderFeatureCaps& caps, std::string post, void (*record_diagnostics)(),
-                                     const GpuTimingView* timing, const GpuPickerView* gpus, const UpdatesView* updates) {
+                                     const GpuTimingView* timing, const GpuPickerView* gpus, const UpdatesView* updates,
+                                     const BenchmarkView* benchmark, const RendererPickerView* renderers) {
     std::vector<SettingsRow> rows;
     {
         const auto shown_name = [](const std::string& text) {
@@ -44,6 +173,7 @@ std::vector<SettingsRow> system_page(const render::RenderFeatureCaps& caps, std:
             rows.push_back(std::move(row));
         }
     }
+    if (renderers != nullptr) renderer_rows(rows, *renderers);
     char text[64]{};
     if (caps.dxr_raytracing_tier != 0u) {
         std::snprintf(text, sizeof(text), "TIER %u.%u %s", caps.dxr_raytracing_tier / 10u, caps.dxr_raytracing_tier % 10u,
@@ -59,9 +189,11 @@ std::vector<SettingsRow> system_page(const render::RenderFeatureCaps& caps, std:
                     "GENERATED FRAMES ON NVIDIA RTX 40 AND 50 GPUS"});
     if (const std::size_t colon = post.find(": "); colon != std::string::npos) post.erase(0, colon + 2u);
     rows.push_back({"POST-PROCESS", post, nullptr, "ANTI-ALIASING, FSR 1 AND SHARPENING"});
-    rows.push_back(button_row("DIAGNOSTICS", {"RECORD"},
-                              [record_diagnostics](RenderConfig&, unsigned) { if (record_diagnostics) record_diagnostics(); },
-                              {}));
+    if (record_diagnostics != nullptr) {
+        rows.push_back(button_row("DIAGNOSTICS", {"RECORD"},
+                                  [record_diagnostics](RenderConfig&, unsigned) { record_diagnostics(); }, {}));
+    }
+    if (benchmark != nullptr) benchmark_rows(rows, *benchmark);
     if (updates != nullptr) {
         rows.push_back({"UPDATES", {}, nullptr, {}, true});
         const std::function<void()> toggle = updates->toggle;
@@ -124,12 +256,24 @@ std::vector<SettingsRow> system_page(const render::RenderFeatureCaps& caps, std:
         rows.push_back({"GPU TIMING", timing->on ? "ON" : "OFF",
                         [toggle](RenderConfig&, int) { if (toggle) toggle(); },
                         "MILLISECONDS THE GPU SPENDS ON EACH PASS OF A FRAME. OFF AT EVERY START; WHILE OFF NOTHING IS MEASURED"});
+        // Each feature's passes under its one name (gpu_pass_label), in the renderer's order.
+        std::vector<std::pair<std::string, float>> features;
         float total = 0.0f;
         for (const auto& [name, ms] : timing->passes) {
+            const char* const label = gpu_pass_label(name);
+            std::string shown = label != nullptr ? std::string(label) : upper_ascii(name);
+            const auto at = std::find_if(features.begin(), features.end(), [&](const auto& f) { return f.first == shown; });
+            if (at == features.end()) {
+                features.emplace_back(std::move(shown), ms);
+            } else {
+                at->second += ms;
+            }
+            total += ms;
+        }
+        for (const auto& [shown, ms] : features) {
             char value[24]{};
             std::snprintf(value, sizeof(value), "%.2f MS", static_cast<double>(ms));
-            rows.push_back({upper_ascii(name), value, nullptr, "AVERAGE OVER THE LAST FRAMES THAT RAN THIS PASS"});
-            total += ms;
+            rows.push_back({shown, value, nullptr, "AVERAGE OVER THE LAST FRAMES THAT RAN THIS PASS"});
         }
         if (timing->on && !timing->passes.empty()) {
             char value[24]{};

@@ -27,13 +27,15 @@ The Start menu shortcut on Windows and `nebula-launch` on Linux pass `--pak` and
 
 | Argument | Value |
 |---|---|
-| `--renderer d3d12` or `--renderer d3d11` | Windows, `Nebula.exe` only. `d3d11` runs `NebulaD11.exe` (the build for the same CPU level) in its place, without starting Direct3D 12. `d3d12` never falls back. Without this argument, Direct3D 11 runs when no graphics adapter can run Direct3D 12. |
+| `--renderer d3d12`, `--renderer vulkan` or `--renderer d3d11` | Windows, `Nebula.exe` only. Overrides the renderer chosen in **Settings** for this start. `vulkan` runs `NebulaVk.exe` and `d3d11` runs `NebulaD11.exe` (the build for the same CPU level) in its place, without starting Direct3D 12. A renderer given here never falls back to another. |
 | `--home 1` or `--home 0` | `1` shows the home screen (**Play**, **Settings**, **Benchmark**, **Quit** and an update notice) before the title screen. `0` goes straight into the game. The default is `1`, except on Android, where the app has its own home screen. A hidden start and a start with `--seconds` also default to `0`. |
 | `--safe-start 1` | Turns every mod off for this start only. Your choices on the **Mods** page stay as they are for the next start. Holding <kbd>Shift</kbd> while Nebula starts does the same. |
 | `--seconds N` | Ends the game after N seconds. |
 | `--hidden 1` | Linux and macOS. Starts without a window and never reads your keyboard, mouse or controllers. Test tools use it. On Windows, a start with a hidden window does the same. |
 
 To choose the graphics card, use **Settings** in Nebula, or set `gpu=` in `config.ini`. When `gpu=` is empty, Nebula uses the high-performance graphics card.
+
+To choose the renderer on Windows, use **Renderer** on the **System** page of **Settings**, or set `renderer=` in `config.ini` to `d3d12`, `vulkan` or `d3d11`. When `renderer=` is `auto` or empty, Nebula uses the newest renderer the graphics card runs: Direct3D 12, then Vulkan, then Direct3D 11. Choosing another graphics card sets the renderer to the newest one that card runs. When no graphics card runs the renderer a start uses, Nebula starts again with the next renderer in that order, and a renderer chosen in **Settings** goes back to `auto`.
 
 ### About safe starts
 
@@ -62,9 +64,16 @@ After a crash with mods turned on, the next start is a safe start. If only mod c
 | Argument | Value |
 |---|---|
 | `--benchmark 1` | Runs the benchmark and exits. The benchmark plays real stages (the list in `benchmark.tsv` beside `game.pak`, or the built-in list), then measures each internal resolution and optional pass, on a blank save kept in memory. It reads your settings but never writes them. It reads and writes no save, Mii, achievement or statistic, and loads no mod. |
-| `--benchmark-out FILE` | With `--benchmark 1`, writes the result to FILE. The default is `diagnostics/benchmark-UTC-TIME.json` in the data folder. |
+| `--benchmark-out FILE` | With `--benchmark 1`, writes the result to FILE. The default is `diagnostics/benchmarks/benchmark-UTC-TIME.json` in the data folder, with the frame times in a `.frames` file beside it. Nebula keeps the newest 5 results there. |
 
 The result holds the measurements, the recommended settings and a summary. A finished run exits with code `0` and its result has `"status":"complete"`.
+
+In the game, the benchmark is in **Settings** > **System** > **Benchmark**:
+
+- **Run benchmark** starts the game again and runs the benchmark. While it runs, a panel at the top left of the screen shows the stage, the step and the frame rate. To stop the run, press Esc, or B on a controller. On Android, press Back.
+- **Last result** opens the results: a summary with a frame-time graph, each stage, where the time goes and the hardware, and the earlier runs.
+- **Apply recommended** adds the recommended settings as changes to apply.
+- **Send to developer** sends the last result once, when the build can send reports.
 
 ## Diagnostics reports
 
@@ -92,12 +101,14 @@ Nebula passes these arguments when it starts itself again. Do not pass them your
 
 | Argument | Value |
 |---|---|
-| `--benchmark-return 1` | Set by **Benchmark** on the home screen, with `--benchmark 1`. When the benchmark ends, the game starts again on the home screen with `--benchmark-result`. |
-| `--benchmark-result FILE` | Opens the result's recommended settings in the settings menu as changes to apply. |
+| `--benchmark-return 1` | Set by **Run benchmark** in the settings menu and by **Benchmark** on the home screen, with `--benchmark 1`. When the benchmark ends, the game starts again with `--benchmark-result`. |
+| `--benchmark-result FILE` | Opens the settings menu on **System** with the results of FILE. FILE is a result, or the results folder for its newest result. |
 | `--gpu-start-retry N` | The number of tries so far when the game starts again because no graphics memory was free. Nebula tries at most 5 times. |
 | `--started-again N` | The number of times the game has started itself again. |
 | `--start-again-of ID-TIME` | Windows only. The process that the new start takes over from. |
+| `--imports-taken 1` | The files given with `--import` were imported before the game started itself again. They are not imported again. |
 | `--crash-report FILE` | Shows the report of an instance that stopped. |
+| `--check-renderers` | Windows only. Checks which renderers each graphics card runs, for **Renderer** in the settings, prints the result and ends. |
 
 ## Arguments for building Nebula
 

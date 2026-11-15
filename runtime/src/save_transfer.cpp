@@ -721,14 +721,16 @@ struct Json {
     std::int64_t number = 0;
     std::string text;
     std::vector<Json> items;
-    // An object's members, names and values side by side: a vector of the type being defined is allowed in C++17, a
-    // pair holding it is not (libstdc++ refuses it).
+    // An object's members: names[i] names values[i]. Two vectors, not one of pairs: a vector of the type being
+    // defined is allowed (C++17), a pair holding it is not (libstdc++ refuses it).
     std::vector<std::string> names;
     std::vector<Json> values;
 
     const Json* member(std::string_view name) const {
         for (std::size_t i = 0; i < names.size(); ++i) {
-            if (names[i] == name) return &values[i];
+            if (names[i] == name) {
+                return &values[i];
+            }
         }
         return nullptr;
     }
@@ -1535,6 +1537,34 @@ bool replaces_saves(const ImportPlan& plan, const std::filesystem::path& save_ro
     }
 }
 
+bool is_save_source(const std::filesystem::path& source, const ImportPlan& plan) noexcept {
+    try {
+        const std::string name = path_text(source.filename());
+        if (same_text(name, kGameData) || same_text(name, kNativeSave)) {
+            return true;
+        }
+    } catch (...) {
+        // A name that does not convert: the contents decide.
+    }
+    switch (plan.kind) {
+    case Kind::kNebulaArchive:
+    case Kind::kNebulaSave:
+    case Kind::kWiiSdSave:
+    case Kind::kDatelSave:
+        return true;
+    case Kind::kGameData:
+        // Its form is known by one version word only: a file that fails the game's check may be anything.
+        return plan.error == Error::kNone;
+    case Kind::kZip:
+    case Kind::kFolder:
+        return plan.error == Error::kNone || plan.error == Error::kNewerVersion || plan.error == Error::kWrongGame ||
+               plan.error == Error::kWrongRegion;
+    case Kind::kUnknown:
+        break;
+    }
+    return false;
+}
+
 ImportResult commit_import(const ImportPlan& plan, const std::filesystem::path& save_root) noexcept {
     ImportResult result;
     if (plan.error != Error::kNone || plan.files.empty()) {
@@ -1762,6 +1792,162 @@ std::filesystem::path game_save_root() {
 std::string game_code() {
     const std::lock_guard<std::mutex> lock(gGameSavesMutex);
     return gGameCode;
+}
+
+// ---- the per-file import ----
+
+namespace {
+
+std::atomic<NebulaSaveImportRead> gGameReader{nullptr};
+
+constexpr std::array<std::string_view, 3> kFileKinds = {"mario", "luigi", "config"};  // SaveDataHandler.cpp cKinds
+
+// A Nebula.sav's rows by name (the 16-byte name without its padding), each its data's span; a later row of a name
+// wins, as the game reads them. False: not a Nebula.sav the game reads.
+bool read_native_rows(ByteSpan save, std::map<std::string, ByteSpan>* rows) {
+    if (check_native_save(save) != Error::kNone) {
+        return false;
+    }
+    const std::size_t count = le32(save.data() + 12);
+    std::size_t place = kNativeHeader + count * kNativeRow;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::byte* const row = save.data() + kNativeHeader + i * kNativeRow;
+        std::size_t length = 0;
+        while (length < 16 && row[length] != std::byte{0}) {
+            ++length;
+        }
+        const std::size_t size = le32(row + 16);
+        (*rows)[std::string(reinterpret_cast<const char*>(row), length)] = save.subspan(place, size);
+        place += size;
+    }
+    return true;
+}
+
+std::string file_name(std::string_view kind, std::size_t user) {
+    return std::string(kind) + std::to_string(user);
+}
+
+}  // namespace
+
+const SaveFile* release_save(const ImportPlan& plan) noexcept {
+    if (plan.error != Error::kNone) {
+        return nullptr;
+    }
+    try {
+        const std::string native = native_save_path(plan.target_code);
+        const std::string game_data = game_data_path(plan.target_code);
+        for (const SaveFile& file : plan.files) {
+            if (file.path == native || file.path == game_data) {
+                return &file;
+            }
+        }
+    } catch (...) {
+    }
+    return nullptr;
+}
+
+bool places_more_than_save(const ImportPlan& plan) noexcept {
+    const SaveFile* const save = release_save(plan);
+    return std::any_of(plan.files.begin(), plan.files.end(), [save](const SaveFile& file) {
+        return &file != save && canonical(file.path).role != Canonical::kBanner;
+    });
+}
+
+Error merge_saves(std::span<const std::byte> current, std::span<const std::byte> imported,
+                  std::span<const std::uint8_t, kUserFiles> targets, std::vector<std::byte>* merged) noexcept {
+    try {
+        merged->clear();
+        std::array<bool, kUserFiles + 1> taken{};
+        bool any = false;
+        for (const std::uint8_t target : targets) {
+            if (target > kUserFiles || (target != 0 && taken[target])) {
+                return Error::kUnsupported;
+            }
+            taken[target] = target != 0;
+            any |= target != 0;
+        }
+        if (!any) {
+            return Error::kNoSaves;
+        }
+        std::map<std::string, ByteSpan> rows;
+        std::map<std::string, ByteSpan> from;
+        if (!read_native_rows(current, &rows) || !read_native_rows(imported, &from)) {
+            return Error::kDamaged;
+        }
+        for (std::size_t i = 0; i < kUserFiles; ++i) {
+            if (targets[i] == 0) {
+                continue;
+            }
+            for (const std::string_view kind : kFileKinds) {
+                const auto it = from.find(file_name(kind, i + 1));
+                rows[file_name(kind, targets[i])] = it != from.end() ? it->second : ByteSpan();
+            }
+        }
+        // The game's own order and rows: each user's game data, Mario's and Luigi's, then its config.
+        constexpr std::size_t kRows = kUserFiles * kFileKinds.size();
+        Bytes out;
+        put32(out, kNativeMagic);
+        put32(out, kNativeVersion);
+        put32(out, 0);  // the CRC-32, once the rest is made
+        put32(out, static_cast<std::uint32_t>(kRows));
+        std::vector<ByteSpan> data;
+        for (std::size_t user = 1; user <= kUserFiles; ++user) {
+            for (const std::string_view kind : kFileKinds) {
+                const std::string name = file_name(kind, user);
+                const auto it = rows.find(name);
+                const ByteSpan bytes = it != rows.end() ? it->second : ByteSpan();
+                std::array<std::byte, 16> padded{};
+                std::memcpy(padded.data(), name.data(), name.size());
+                out.insert(out.end(), padded.begin(), padded.end());
+                put32(out, static_cast<std::uint32_t>(bytes.size()));
+                data.push_back(bytes);
+            }
+        }
+        for (const ByteSpan bytes : data) {
+            out.insert(out.end(), bytes.begin(), bytes.end());
+        }
+        if (out.size() > kMaxFileBytes) {
+            return Error::kTooLarge;
+        }
+        const std::uint32_t crc = crc32_of(ByteSpan(out).subspan(kNativeHeader));
+        for (std::size_t i = 0; i < 4; ++i) {
+            out[8 + i] = static_cast<std::byte>((crc >> (8 * i)) & 0xFFu);
+        }
+        *merged = std::move(out);
+        return Error::kNone;
+    } catch (...) {
+        merged->clear();
+        return Error::kIo;  // out of memory
+    }
+}
+
+ImportPlan plan_native_save(std::vector<std::byte> save, std::string_view code) noexcept {
+    ImportPlan plan;
+    try {
+        plan.kind = Kind::kNebulaSave;
+        plan.target_code = code;
+        if (!is_release_code(code)) {
+            plan.error = Error::kWrongGame;
+            return plan;
+        }
+        if (const Error error = check_native_save(save); error != Error::kNone) {
+            plan.error = error == Error::kUnsupported ? Error::kDamaged : error;
+            return plan;
+        }
+        plan.codes.push_back(std::string(code));
+        plan.files.push_back({native_save_path(code), std::move(save)});
+    } catch (...) {
+        plan.error = Error::kIo;
+    }
+    return plan;
+}
+
+void set_game_reader(NebulaSaveImportRead read) noexcept {
+    gGameReader.store(read, std::memory_order_release);
+}
+
+NebulaSaveImportRead game_reader() noexcept {
+    return gGameReader.load(std::memory_order_acquire);
 }
 
 namespace detail {

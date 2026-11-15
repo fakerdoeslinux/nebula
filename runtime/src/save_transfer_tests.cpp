@@ -9,6 +9,7 @@
 #include <openssl/md5.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -713,6 +714,175 @@ void test_folders(const fs::path& base) {
 
 }  // namespace
 
+// ---- the per-file import ----
+
+// A Nebula.sav with these rows, in this order (a row's data: `seed`, its index and its place).
+Bytes make_rows(const std::vector<std::pair<std::string, std::size_t>>& rows, std::uint8_t seed) {
+    Bytes out(16 + rows.size() * 20);
+    put_le32(out, 0, 0x5653424Eu);
+    put_le32(out, 4, 4);
+    put_le32(out, 12, static_cast<std::uint32_t>(rows.size()));
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        put_text(out, 16 + i * 20, rows[i].first);
+        put_le32(out, 16 + i * 20 + 16, static_cast<std::uint32_t>(rows[i].second));
+        for (std::size_t j = 0; j < rows[i].second; ++j) {
+            out.push_back(static_cast<std::byte>(seed * 17 + i * 31 + j));
+        }
+    }
+    put_le32(out, 8, crc32_of(out.data() + 16, out.size() - 16));
+    return out;
+}
+
+// The game's 18 rows (each user's Mario, Luigi, config), each sized by its user and kind.
+Bytes make_full_save(std::uint8_t seed) {
+    std::vector<std::pair<std::string, std::size_t>> rows;
+    for (int user = 1; user <= 6; ++user) {
+        for (const char* kind : {"mario", "luigi", "config"}) {
+            rows.push_back({kind + std::to_string(user), static_cast<std::size_t>(8 + user * 3 + std::strlen(kind))});
+        }
+    }
+    return make_rows(rows, seed);
+}
+
+std::vector<std::pair<std::string, Bytes>> native_rows(const Bytes& save) {
+    std::vector<std::pair<std::string, Bytes>> rows;
+    const std::size_t count = static_cast<std::size_t>(std::to_integer<unsigned>(save[12])) |
+                              static_cast<std::size_t>(std::to_integer<unsigned>(save[13])) << 8;
+    std::size_t place = 16 + count * 20;
+    for (std::size_t i = 0; i < count; ++i) {
+        const char* const name = reinterpret_cast<const char*>(save.data() + 16 + i * 20);
+        const std::size_t size = static_cast<std::size_t>(std::to_integer<unsigned>(save[16 + i * 20 + 16])) |
+                                 static_cast<std::size_t>(std::to_integer<unsigned>(save[16 + i * 20 + 17])) << 8;
+        rows.push_back({std::string(name, strnlen(name, 16)), Bytes(save.begin() + static_cast<std::ptrdiff_t>(place),
+                                                                    save.begin() + static_cast<std::ptrdiff_t>(place + size))});
+        place += size;
+    }
+    return rows;
+}
+
+Bytes row_of(const Bytes& save, std::string_view name) {
+    for (auto& [row, bytes] : native_rows(save)) {
+        if (row == name) return bytes;
+    }
+    return bytes_of("absent");
+}
+
+std::int32_t no_read(const std::uint8_t*, std::uint32_t, NebulaSaveImportDone, void*) { return NEBULA_SAVE_IMPORT_BUSY; }
+
+void test_by_file(const fs::path& base) {
+    const Bytes current = make_full_save(1);
+    const Bytes imported = make_full_save(2);
+    Bytes merged;
+    const std::array<std::uint8_t, 6> targets = {3, 0, 0, 0, 0, 1};
+    CHECK(st::merge_saves(current, imported, targets, &merged) == Error::kNone);
+    // The game's order, all 18 rows; imported 1 in 3 and imported 6 in 1, the rest as they were.
+    const auto rows = native_rows(merged);
+    CHECK(rows.size() == 18);
+    std::size_t at = 0;
+    for (int user = 1; user <= 6; ++user) {
+        for (const char* kind : {"mario", "luigi", "config"}) {
+            const std::string name = kind + std::to_string(user);
+            CHECK(at < rows.size() && rows[at].first == name);
+            const int from = user == 3 ? 1 : user == 1 ? 6 : 0;
+            const Bytes expected = from != 0 ? row_of(imported, kind + std::to_string(from)) : row_of(current, name);
+            CHECK(at < rows.size() && rows[at].second == expected);
+            ++at;
+        }
+    }
+    CHECK(st::plan_native_save(merged, "RMGE").error == Error::kNone);  // its CRC and sizes check
+
+    // An imported save without a user's every row: the missing row is empty in the target.
+    const Bytes partial = make_rows({{"mario1", 24}, {"config1", 8}}, 9);
+    CHECK(st::merge_saves(current, partial, std::array<std::uint8_t, 6>{4, 0, 0, 0, 0, 0}, &merged) == Error::kNone);
+    CHECK(row_of(merged, "mario4") == row_of(partial, "mario1") && row_of(merged, "luigi4").empty() &&
+          row_of(merged, "config4") == row_of(partial, "config1") && row_of(merged, "mario5") == row_of(current, "mario5"));
+
+    // A choice never sends two files to one, nor past the sixth; one at least; both saves the game's.
+    CHECK(st::merge_saves(current, imported, std::array<std::uint8_t, 6>{2, 2, 0, 0, 0, 0}, &merged) == Error::kUnsupported);
+    CHECK(st::merge_saves(current, imported, std::array<std::uint8_t, 6>{7, 0, 0, 0, 0, 0}, &merged) == Error::kUnsupported);
+    CHECK(st::merge_saves(current, imported, std::array<std::uint8_t, 6>{}, &merged) == Error::kNoSaves && merged.empty());
+    Bytes damaged = current;
+    damaged.back() ^= std::byte{1};
+    CHECK(st::merge_saves(damaged, imported, targets, &merged) == Error::kDamaged);
+    CHECK(st::merge_saves(current, make_game_data(true, 2), targets, &merged) == Error::kDamaged);
+    CHECK(st::merge_saves(current, Bytes{}, targets, &merged) == Error::kDamaged);
+
+    // The plan that writes it: the release's save whole, its copies and an old GameData.bin to the backup.
+    CHECK(st::plan_native_save(bytes_of("not a save"), "RMGE").error == Error::kDamaged);
+    CHECK(st::plan_native_save(merged, "XXXX").error == Error::kWrongGame);
+    CHECK(st::merge_saves(current, imported, targets, &merged) == Error::kNone);
+    const st::ImportPlan plan = st::plan_native_save(merged, "RMGE");
+    CHECK(plan.error == Error::kNone && plan.files.size() == 1 && plan.files[0].path == "RMGE/Nebula.sav" &&
+          plan.codes == std::vector<std::string>{"RMGE"});
+    const fs::path root = base / "by-file" / "saves";
+    const Bytes keep = bytes_of("another release's save");
+    write_all(root / "RMGE" / "Nebula.sav", current);
+    write_all(root / "RMGE" / "Nebula.sav.2", make_native_save(4, 5));
+    write_all(root / fs::path(kGameDataE), make_game_data(true, 2, 3));
+    write_all(root / "RMGP" / "Nebula.sav", keep);
+    const auto before = listing(root);
+    // A quit or a failure at any move: every file as it was.
+    for (const int step : {1, 2, 3, 4}) {
+        st::detail::set_commit_fault(step);
+        CHECK(st::commit_import(plan, root).error == Error::kIo);
+        st::detail::set_commit_fault(0);
+        CHECK(listing(root) == before && siblings(root).empty());
+    }
+    const st::ImportResult result = st::commit_import(plan, root);
+    CHECK(result.error == Error::kNone && result.written == 1);
+    const auto after = listing(root);
+    CHECK(after.size() == 2 && after[0].first == "RMGE/Nebula.sav" && after[0].second == merged &&
+          after[1].first == "RMGP/Nebula.sav" && after[1].second == keep);
+    CHECK(listing(result.backup).size() == 3);
+
+    // The release's save in a plan, and whether the plan holds more.
+    st::ImportPlan single = st::plan_import(make_game_data(true, 2, 3), "RMGE");
+    CHECK(st::release_save(single) != nullptr && st::release_save(single)->path == kGameDataE &&
+          !st::places_more_than_save(single));
+    st::ImportPlan with_miis = st::plan_import(
+        make_zip({{"RMGE/Nebula.sav", make_native_save()}, {"shared2/menu/FaceLib/RFL_DB.dat", make_mii_database()}}), "RMGE");
+    CHECK(with_miis.error == Error::kNone && st::release_save(with_miis) != nullptr &&
+          st::release_save(with_miis)->path == "RMGE/Nebula.sav" && st::places_more_than_save(with_miis));
+    st::ImportPlan other_release = st::plan_import(make_zip({{"RMGJ/Nebula.sav", make_native_save()}}), "RMGE");
+    CHECK(other_release.error == Error::kNone && st::release_save(other_release) != nullptr);
+    CHECK(st::release_save(st::plan_import(bytes_of("no"), "RMGE")) == nullptr);
+
+    // The game's reader, as the host gives it.
+    CHECK(st::game_reader() == nullptr);
+    st::set_game_reader(no_read);
+    CHECK(st::game_reader() == no_read);
+    st::set_game_reader(nullptr);
+    CHECK(st::game_reader() == nullptr);
+}
+
+// A dropped file is a save by its name or by its contents; a mod's zip, a Mii file and any other file are not.
+void test_save_source(const fs::path& base) {
+    const auto source = [](const Bytes& bytes, const char* name) {
+        return st::is_save_source(fs::path("drop") / name, st::plan_import(bytes, "RMGE"));
+    };
+    CHECK(source(make_game_data(true, 2), "a.bin") && source(make_game_data(false, 3), "save"));
+    Bytes broken = make_game_data(true, 2);
+    broken[40] ^= std::byte{1};
+    CHECK(!source(broken, "a.bin") && source(broken, "GameData.bin") && source(broken, "gamedata.BIN"));
+    CHECK(source(make_native_save(), "x") && source(make_native_save(9), "x"));  // a later version: still a save
+    Bytes broken_native = make_native_save();
+    broken_native.back() ^= std::byte{1};
+    CHECK(source(broken_native, "x") && source(bytes_of("anything"), "Nebula.sav"));
+    CHECK(source(make_sd_save("RMGE", make_game_data(true, 2), make_banner()), "data.bin"));
+    CHECK(source(make_zip({{"RMGE/Nebula.sav", make_native_save()}}), "saves.zip"));
+    CHECK(source(make_zip({{"nebula-saves.json", bytes_of("{")}}), "export.zip"));  // a damaged Nebula saves archive
+    CHECK(!source(make_zip({{"mod.json", bytes_of("{}")}, {"textures/a.dds", bytes_of("dds")}}), "Cool Mod.zip"));
+    CHECK(!source(make_mii_database(), "RFL_DB.dat") && !source(bytes_of("not a save"), "a.mii") && !source(Bytes{}, "x"));
+
+    const fs::path folder = base / "drop-folder";
+    write_all(folder / "saves" / "RMGE" / "Nebula.sav", make_native_save());
+    CHECK(st::is_save_source(folder, st::plan_import(folder, "RMGE")));
+    const fs::path mod = base / "drop-mod";
+    write_all(mod / "mod.json", bytes_of("{}"));
+    write_all(mod / "textures" / "a.dds", bytes_of("dds"));
+    CHECK(!st::is_save_source(mod, st::plan_import(mod, "RMGE")));
+}
+
 int main() {
     const fs::path base = galaxy::test_temp_path("galaxy_save_transfer_tests");
     std::error_code error;
@@ -727,6 +897,8 @@ int main() {
     test_commit(base);
     test_export(base);
     test_folders(base);
+    test_by_file(base);
+    test_save_source(base);
     fs::remove_all(base, error);
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";

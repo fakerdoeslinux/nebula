@@ -7,8 +7,10 @@
 
 #include <atomic>
 #include <cstddef>
+#include <exception>
+#include <filesystem>
+#include <iostream>
 #include <mutex>
-#include <optional>
 #include <string>
 
 namespace galaxy::ui {
@@ -35,9 +37,7 @@ std::atomic<bool> s_opened{false};
 std::mutex s_text_mutex;
 std::u16string s_version;
 std::u16string s_notes;
-std::optional<galaxy::render::RenderConfig> s_draft;  // under s_text_mutex
-std::atomic<void (*)(int)> s_upload{nullptr};
-constexpr unsigned kGraphicsPage = 1u;                // native_settings.cpp kNativeSettingsTabNames
+std::filesystem::path s_results;  // under s_text_mutex: the benchmark result to show once
 
 // UTF-8 as UTF-16, at most `limit` units and `lines` lines, without control characters but line breaks; a malformed
 // sequence becomes U+FFFD.
@@ -77,28 +77,25 @@ std::u16string utf16_of(std::string_view text, std::size_t limit, std::size_t li
     return out;
 }
 
-// The recommendation's draft, once: when the screen opens, or after the upload question when one shows.
-void open_draft() {
-    std::optional<galaxy::render::RenderConfig> draft;
-    {
-        const std::lock_guard<std::mutex> lock(s_text_mutex);
-        draft.swap(s_draft);
-    }
-    if (draft) {
-        galaxy::render::host_window::open_native_settings_draft(kGraphicsPage, *draft);
+// The benchmark's results window, once.
+void open_results() noexcept {
+    try {
+        std::filesystem::path results;
+        {
+            const std::lock_guard<std::mutex> lock(s_text_mutex);
+            results.swap(s_results);
+        }
+        if (!results.empty()) {
+            galaxy::render::host_window::open_native_settings_results(results);
+        }
+    } catch (const std::exception& failure) {
+        std::cerr << "[launcher] the benchmark's results did not open: " << failure.what() << '\n';
     }
 }
 
 void apply(LauncherModel::Effect effect) {
     switch (effect) {
     case LauncherModel::Effect::OpenSettings: galaxy::render::host_window::open_native_settings(0u); break;
-    case LauncherModel::Effect::ShowReport:
-    case LauncherModel::Effect::SendReport:
-        if (void (*const act)(int) = s_upload.load(std::memory_order_acquire)) {
-            act(effect == LauncherModel::Effect::SendReport ? 1 : 0);
-        }
-        break;
-    case LauncherModel::Effect::UploadLeft: open_draft(); break;
     case LauncherModel::Effect::None: break;
     }
 }
@@ -114,38 +111,18 @@ void launcher_offer_benchmark(bool on) noexcept {
     s_model.benchmark = on;
 }
 
-void launcher_offer_message() noexcept {
-    s_model.offer_message();
-}
-
-void launcher_offer_upload(void (*act)(int what)) noexcept {
-    s_upload.store(act, std::memory_order_release);
-    s_model.offer_upload();
-}
-
-void launcher_upload_finished(bool sent) noexcept {
-    s_model.upload_finished(sent);
-}
-
-void launcher_show_draft(const galaxy::render::RenderConfig& draft) {
+void launcher_show_results(const std::filesystem::path& result) {
     const std::lock_guard<std::mutex> lock(s_text_mutex);
-    s_draft = draft;
+    s_results = result;
 }
 
 bool launcher_open() noexcept {
-    if (!s_enabled.load(std::memory_order_relaxed) || s_opened.exchange(true, std::memory_order_relaxed)) {
-        return false;
+    const bool opened = s_enabled.load(std::memory_order_relaxed) && !s_opened.exchange(true, std::memory_order_relaxed);
+    if (opened) {
+        s_model.open();
     }
-    s_model.open();
-    bool asking = false;
-    {
-        const std::lock_guard<std::mutex> lock(s_model.mutex);
-        asking = s_model.upload_page != 0u || s_model.message_page;
-    }
-    if (!asking) {
-        open_draft();  // else after the pages before it (apply: UploadLeft)
-    }
-    return true;
+    open_results();  // over the home screen, or over the boot where there is none
+    return opened;
 }
 
 bool launcher_visible() noexcept {

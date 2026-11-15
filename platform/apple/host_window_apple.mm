@@ -13,6 +13,7 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include "galaxy/benchmark.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/controller_hid.h"
 #include "galaxy/game_paths.h"
@@ -79,6 +80,10 @@ id g_delegate = nil;
 std::vector<std::filesystem::path> g_opened_early;  // files opened before the window (the main thread's)
 std::atomic<void*> g_layer{nullptr};  // the view's CAMetalLayer, for the renderer's thread
 std::atomic<bool> g_background{false};
+// The system asked for memory (the memory pressure source's warning or critical level) since the host last took it.
+std::atomic<bool> g_low_memory{false};
+// The memory pressure source (start): kept for the process's life.
+dispatch_source_t g_memory_pressure = nil;
 std::atomic<bool> g_menu_context{false};
 std::atomic<bool> g_title_screen{false};
 std::atomic<bool> g_direct_touch{false};
@@ -698,7 +703,8 @@ void files_opened(NSArray<NSURL*>* urls) {
     [super viewDidChangeBackingProperties];
     self.layer.contentsScale = self.window != nil ? self.window.backingScaleFactor : 1.0;
 }
-// Files dropped on the window: mods to the importer, Mii files to the Mii import (native_settings_files_dropped).
+// Files dropped on the window: a save to the save import, mods to the importer, Mii files to the Mii import
+// (native_settings_files_dropped).
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     return NSDragOperationCopy;
 }
@@ -928,6 +934,19 @@ bool start() noexcept {
             open_gamepad(controller);
         }
     }
+    // The system's memory pressure, as Android's onTrimMemory: the host lets go of what comes back by itself
+    // (take_low_memory). The source's handler runs on a global queue and only sets the flag.
+    if (g_memory_pressure == nil) {
+        g_memory_pressure = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                                   DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (g_memory_pressure != nil) {
+            dispatch_source_set_event_handler(g_memory_pressure, ^{
+                g_low_memory.store(true, std::memory_order_release);
+            });
+            dispatch_resume(g_memory_pressure);
+        }
+    }
     return true;
 }
 
@@ -1059,7 +1078,7 @@ void pump_events(int timeout_ms) noexcept {
             const galaxy::input::NativeSettingsPadStep step = galaxy::input::native_settings_pad_step(
                 g_menu_pad, buttons, sample.axes[0], sample.axes[1],
                 galaxy::render::native_settings_overlay_visible() || galaxy::render::home_menu_visible() ||
-                    galaxy::ui::launcher_visible(),
+                    galaxy::ui::launcher_visible() || galaxy::bench::running(),
                 galaxy::steady_ms());
             for (std::size_t i = 0; i < step.key_count; ++i) {
                 galaxy::render::native_settings_post_key(step.keys[i]);
@@ -1123,6 +1142,10 @@ void set_direct_touch(bool direct) noexcept {
 
 bool in_background() noexcept {
     return g_background.load(std::memory_order_acquire);
+}
+
+bool take_low_memory() noexcept {
+    return g_low_memory.exchange(false, std::memory_order_acq_rel);
 }
 
 InputState input_state() noexcept {
@@ -1471,19 +1494,23 @@ VendorLicense vendor_license(std::string&) {
 }
 
 namespace {
-std::atomic<int> restart_request{0};  // restart_wanted: 0 none, 1 a start, 2 a diagnostics run
+std::atomic<int> restart_request{0};  // restart_wanted: 0 none, else a Restart's value
 }  // namespace
 
 // The game ends as for Quit, and the host starts it again as it leaves (host_main finish_and_exit: an exec of this
-// executable), with --diagnostics 1 for a diagnostics run.
-bool restart_game(bool record) {
-    restart_request.store(record ? 2 : 1, std::memory_order_release);
+// executable), with the arguments of the start `kind` asks for.
+bool restart_game(Restart kind) {
+    restart_request.store(static_cast<int>(kind), std::memory_order_release);
     quit_request.store(true, std::memory_order_release);
     return true;
 }
 
 int restart_wanted() noexcept {
     return restart_request.load(std::memory_order_acquire);
+}
+
+bool can_restart() noexcept {
+    return true;
 }
 
 void quit_game() noexcept {

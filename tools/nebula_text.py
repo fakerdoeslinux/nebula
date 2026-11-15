@@ -36,6 +36,8 @@ HOST_NOT_SHOWN = {'SSAO', 'GTAO', 'SB4', 'SB5', '(BLUETOOTH)', '(BT)', '-OPTIONS
                   'VIEW+MENU OR MINUS+PLUS', 'DLSS READY', 'DLSS WAS NOT INSTALLED', 'DOWNLOAD NVIDIA DLSS (',
                   'INSTALLING NVIDIA DLSS...', 'RESTART NOW? ENTER/Y YES  ESC/B LATER', 'HOME MENU', 'NO', 'YES',
                   'RESET?', 'RETURN TO GAME',
+                  # an answer shown unavailable ('-' marks it; the APPLY row is its text)
+                  '-APPLY',
                   # pieces joined at run time whose whole texts have rows: "INPUT: AUTO (<device>)", "THE GAME RUNS AT 60. INTERPOLATION ..."
                   'INPUT: AUTO (', '. INTERPOLATION ADDS FRAMES BETWEEN',
                   # the mods: unavailable buttons, hex digits, the game's id, the head of "ON (1 OF 2)"

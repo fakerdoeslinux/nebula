@@ -453,7 +453,7 @@ bool input_message_injected() noexcept {
     return GetCurrentInputMessageSource(&source) && source.originId == IMO_INJECTED;
 }
 
-// restart_game's request (restart_wanted): 0 none, 1 a start, 2 a diagnostics run.
+// restart_game's request (restart_wanted): 0 none, else a Restart's value.
 std::atomic<int> restart_request{0};
 
 
@@ -585,8 +585,8 @@ OpenedWindow open_game_window(WindowOwner& owner, int window_width, int window_h
         settings_window.store(
             reinterpret_cast<std::uintptr_t>(opened.window), std::memory_order_release);
         // Files the game was started to import (Open with, --import): as a drop on the window.
-        if (!::galaxy::launch_args().imports.empty()) {
-            native_settings_files_dropped(::galaxy::launch_args().imports);
+        if (std::vector<std::filesystem::path> imports = native_settings_take_launch_imports(); !imports.empty()) {
+            native_settings_files_dropped(std::move(imports));
         }
         // LumaCore's clipboard and links on Windows (services-system 5, 6).
         galaxy::luma_system::set_platform(galaxy::luma_system::win32_platform());
@@ -1718,19 +1718,23 @@ VendorLicense vendor_license(std::string& text) {
 }
 
 // The window closes, and the host starts the game again as it ends (host_main finish_and_exit: a new process that takes
-// over this one's files, --start-again-of), with --diagnostics 1 for a diagnostics run.
-bool restart_game(bool record) {
+// over this one's files, --start-again-of), with the arguments of the start `kind` asks for.
+bool restart_game(Restart kind) {
     const HWND window = reinterpret_cast<HWND>(settings_window.load(std::memory_order_acquire));
     if (window == nullptr) {
         return false;
     }
-    restart_request.store(record ? 2 : 1, std::memory_order_release);
+    restart_request.store(static_cast<int>(kind), std::memory_order_release);
     PostMessageW(window, WM_CLOSE, 0, 0);
     return true;
 }
 
 int restart_wanted() noexcept {
     return restart_request.load(std::memory_order_acquire);
+}
+
+bool can_restart() noexcept {
+    return true;
 }
 
 void quit_game() noexcept {

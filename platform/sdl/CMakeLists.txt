@@ -86,10 +86,13 @@ set(rt "${nebula_root}/runtime/src")
 add_library(galaxy_render_vk STATIC
     ${rt}/render/render_api.cpp
     ${rt}/render/render_config.cpp
+    ${rt}/render/renderer_choice.cpp
     ${rt}/ui/native_settings.cpp
     ${rt}/ui/launcher.cpp
     ${rt}/ui/settings_model.cpp
     ${rt}/ui/settings_system_page.cpp
+    ${rt}/ui/settings_benchmark_page.cpp
+    ${rt}/ui/benchmark_menu.cpp
     ${rt}/ui/settings_advanced_page.cpp
     ${rt}/ui/settings_display_page.cpp
     ${rt}/ui/settings_general_page.cpp
@@ -124,6 +127,9 @@ add_library(galaxy_render_vk STATIC
     ${rt}/render/galaxy_select.cpp
     ${rt}/benchmark_recommend.cpp
     ${rt}/benchmark.cpp
+    ${rt}/benchmark_stats.cpp
+    ${rt}/benchmark_results.cpp
+    ${rt}/strict_json.cpp
     ${rt}/render/frame_interpolation.cpp
     ${rt}/render/rt_materials.cpp
     ${rt}/render/rt_caps.cpp

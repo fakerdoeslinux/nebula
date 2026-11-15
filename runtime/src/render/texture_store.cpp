@@ -3,6 +3,7 @@
 #include "galaxy/windows_api.h"
 
 #include "galaxy/render/texture_store.h"
+#include "galaxy/benchmark.h"
 
 #include "galaxy/loss_report.h"
 #include "galaxy/render/block4_astc.h"
@@ -386,6 +387,7 @@ bool TextureStore::stage_image(Op& op, const void* bytes, std::uint32_t size, st
 }
 
 std::uint32_t TextureStore::register_image(const NebulaTextureImage& image) {
+    galaxy::bench::note_texture(image.size);
     return gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Create;
@@ -408,6 +410,7 @@ void TextureStore::update_image(std::uint32_t id, const void* bytes, std::uint32
     if (id == 0u || is_target(id)) {
         return;
     }
+    galaxy::bench::note_texture(size);
     gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Update;

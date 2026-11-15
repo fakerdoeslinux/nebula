@@ -6,8 +6,8 @@
 // module or the pak are touched. A build whose diag_endpoint.h is empty refuses --send-report (exit 2) and the apps
 // hide the choice.
 //
-// The report: {"report":1,"benchmark":<the --benchmark 1 result, schema 1>,"log":[<lines>]}. "log" only when the
-// player ticks "Include the last game log": the last 200 lines (32 KiB at most) of the last run's log, each stripped
+// The report: {"report":1,"benchmark":<the --benchmark 1 result, schema 1>,"log":[<lines>]}. "log" only with
+// --with-log 1 (the game's own send has none): the last 200 lines (32 KiB at most) of the last run's log, each stripped
 // (strip_log_line). Never in a report: saves, Miis, settings files, mods, paths, user or computer names, serials.
 //
 // The envelope, version 1 (at most 256 KiB; an opened report at most 1 MiB, refused when larger):

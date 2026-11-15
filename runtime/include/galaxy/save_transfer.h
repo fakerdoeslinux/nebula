@@ -18,9 +18,15 @@
 // <save root>-backup-<date> beside the save root, in the same layout. Nothing is written until the whole source has
 // been read and checked; a failed import puts every file back. Paths are relative to the save root, '/'-separated.
 //
+// The per-file import places chosen user files of the source in chosen user files of the save: the game module reads
+// the source's save as its start reads a save and gives it with the save in memory, both as Nebula.sav
+// (nebula_save_import.h); merge_saves puts the chosen files together, and the result is placed as a whole import is.
+//
 // Every size read from a source is bounded; zip entries that leave the folder ("..", absolute, drive) refuse the
 // whole source. No function throws.
 #pragma once
+
+#include <nebula_save_import.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -102,6 +108,12 @@ struct ImportPlan {
 // Whether committing `plan` replaces a save the save root holds (ask the player first).
 [[nodiscard]] bool replaces_saves(const ImportPlan& plan, const std::filesystem::path& save_root) noexcept;
 
+// Whether `source`, read as `plan`, is a save, so that a file dropped on the window or opened with the game goes to the
+// save import rather than the mod or Mii import: a file named GameData.bin or Nebula.sav, a file of a save's own form
+// (a Nebula saves archive, a Nebula.sav, a Wii SD save, a Datel save) whatever its checks found, a GameData.bin that
+// passes the game's check, and a zip or folder in which a save was found (of another game or release included).
+[[nodiscard]] bool is_save_source(const std::filesystem::path& source, const ImportPlan& plan) noexcept;
+
 struct ImportResult {
     Error error = Error::kNone;
     std::filesystem::path backup;  // the replaced files; empty when nothing was replaced
@@ -132,6 +144,32 @@ struct ExportResult {
 void set_game_saves(const std::filesystem::path& save_root, std::string_view code);
 [[nodiscard]] std::filesystem::path game_save_root();
 [[nodiscard]] std::string game_code();
+
+// ---- the per-file import ----
+
+inline constexpr std::size_t kUserFiles = NEBULA_SAVE_IMPORT_FILES;  // a save's user files, 1 to 6
+
+// The save of the plan's target release, which the per-file import has the game read: its Nebula.sav or GameData.bin.
+// Null when the plan places none.
+[[nodiscard]] const SaveFile* release_save(const ImportPlan& plan) noexcept;
+// Whether the plan places more than that save and its banner (Miis, mods' files, another release's save): only its
+// whole import brings them.
+[[nodiscard]] bool places_more_than_save(const ImportPlan& plan) noexcept;
+
+// `current` with imported user file i + 1 (its game data and its config) in user file targets[i] (1 to 6; 0 leaves it
+// out), in Nebula.sav's form, rows in the game's order. Both are Nebula.sav files as the game makes them
+// (nebula_save_import.h). kDamaged: either is not one; kUnsupported: a target past 6, or one given twice; kNoSaves:
+// none chosen.
+[[nodiscard]] Error merge_saves(std::span<const std::byte> current, std::span<const std::byte> imported,
+                                std::span<const std::uint8_t, kUserFiles> targets, std::vector<std::byte>* merged) noexcept;
+// A plan placing `save` (a Nebula.sav) as release `code`'s save: commit_import moves that release's save and copies to
+// the backup first, as a whole import does. kDamaged when `save` is not a Nebula.sav.
+[[nodiscard]] ImportPlan plan_native_save(std::vector<std::byte> save, std::string_view code) noexcept;
+
+// The game module's nebula_save_import_read, given by the host once the module is loaded; null before, and with a
+// module without it (the import is then whole only).
+void set_game_reader(NebulaSaveImportRead read) noexcept;
+[[nodiscard]] NebulaSaveImportRead game_reader() noexcept;
 
 namespace detail {
 
