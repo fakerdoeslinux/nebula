@@ -721,13 +721,14 @@ struct Json {
     std::int64_t number = 0;
     std::string text;
     std::vector<Json> items;
-    std::vector<std::pair<std::string, Json>> members;
+    // An object's members, names and values side by side: a vector of the type being defined is allowed in C++17, a
+    // pair holding it is not (libstdc++ refuses it).
+    std::vector<std::string> names;
+    std::vector<Json> values;
 
     const Json* member(std::string_view name) const {
-        for (const auto& [key, value] : members) {
-            if (key == name) {
-                return &value;
-            }
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == name) return &values[i];
         }
         return nullptr;
     }
@@ -873,7 +874,8 @@ private:
                 if (!string_of(key) || !take(':') || !value_of(value, depth + 1)) {
                     return false;
                 }
-                out.members.emplace_back(std::move(key), std::move(value));
+                out.names.push_back(std::move(key));
+                out.values.push_back(std::move(value));
             } while (take(','));
             return take('}');
         }
