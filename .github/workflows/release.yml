@@ -11,6 +11,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: ['ci/release-4']
   workflow_dispatch:
     inputs:
       tag:
