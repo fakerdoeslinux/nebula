@@ -65,6 +65,11 @@ target_link_libraries(galaxy_render_mtl PRIVATE nebula_msl)
 target_link_libraries(galaxy_render_mtl PRIVATE nebula_bssl_ssl nebula_zinflate)
 set_property(SOURCE "${nebula_root}/runtime/src/save_transfer.cpp" APPEND PROPERTY INCLUDE_DIRECTORIES
     "${nebula_root}/native/petari/include")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # The settings' UPDATES rows (native_settings.cpp), as galaxy_render_vk has them on macOS: the service is
+    # nebula_native's (CMakeLists.txt); iOS updates through its store.
+    target_compile_definitions(galaxy_render_mtl PRIVATE NEBULA_UPDATE_CHECK=1)
+endif()
 target_link_libraries(galaxy_render_mtl PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation"
     "-framework CoreGraphics" "-framework IOSurface")
 # MetalFX is asked for at run time (macOS 13, iOS 16): the program starts without it.
