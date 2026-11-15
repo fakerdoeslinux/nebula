@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "galaxy/game_step.h"
+#include "galaxy/render/renderer_choice.h"
 
 namespace galaxy::render {
 
@@ -172,6 +173,9 @@ struct RenderConfig {
     // GPU that is not present, picks one automatically (the high-performance GPU first). Set at start-up from
     // config.ini (GALAXY_GPU overrides) and kept for the session; see next_start_gpu().
     std::array<char, 32> gpu{};
+    // The renderer this session's start chose (config.ini renderer, a RendererKind: 0 the automatic choice); see
+    // next_start_renderer().
+    unsigned renderer = 0;
     // Game picture aspect, an index of kAspectRatios (0 follows the window's shape). Applied at the next video
     // frame.
     unsigned aspect_mode         = 0;
@@ -246,7 +250,7 @@ inline constexpr unsigned kAspectRatios[kAspectModeCount][2] = {
 inline constexpr const char* kAspectNames[kAspectModeCount] = {"auto", "4:3", "3:2", "16:10", "16:9", "21:9", "32:9"};
 
 // Window sizes of exactly an aspect_mode's shape that fit max_width x max_height, smallest first; none for
-// aspect_mode 0. The launcher's GraphicsSettings.AspectWindowSizes lists the same sizes.
+// aspect_mode 0.
 inline std::vector<std::pair<unsigned, unsigned>> aspect_window_sizes(
     unsigned aspect_mode, unsigned max_width, unsigned max_height) {
     static constexpr unsigned kHeights[] = {
@@ -393,17 +397,45 @@ bool save_render_config_to_file();
 [[nodiscard]] unsigned first_start_internal_height(bool shared_memory, unsigned output_lines) noexcept;
 // The PERFORMANCE preset: the 3D scene and the 2D layer at 480 lines and one enlarge at present, every optional pass off.
 void apply_performance_preset(RenderConfig& cfg) noexcept;
+// The benchmark's standard settings, the same on every device so their results compare: the scene at 1920 x 1080 (16:9
+// at 1080 lines, whatever the window's shape), MSAA 4x, SMAA high, ambient occlusion, enhanced and per-pixel lighting,
+// bloom, enhanced mipmaps and 16x anisotropic filtering; no upscaler, dynamic resolution, frame generation, ray tracing,
+// HDR or VSync. The window, display and GPU stay as they are.
+inline constexpr unsigned kBenchmarkStandardLines = 1080u;
+inline constexpr unsigned kBenchmarkStandardAspect = 4u;  // kAspectRatios: 16:9
+void apply_benchmark_standard(RenderConfig& cfg) noexcept;
 
 // A GPU's identity in config.ini's gpu key: PCI vendor, device and subsystem id in lowercase hex,
 // "vvvv:dddd:ssssssss". The subsystem tells two boards of the same chip apart.
 std::string gpu_identity(unsigned vendor_id, unsigned device_id, unsigned subsys_id);
 
-// The gpu config.ini names, which the next start renders on. Nebula Settings owns the key: a reload
-// takes it here and leaves RenderConfig::gpu as the session started, and every save writes the value
-// the file has at that moment (this one when it cannot be read), never GALAXY_GPU.
+// The gpu config.ini names, which the next start renders on. A reload takes it here and leaves RenderConfig::gpu as
+// the session started; a save writes the one choose_next_start_gpu chose, else the value the file has at that moment
+// (an edit made outside the game; this one when it cannot be read), never GALAXY_GPU.
 std::string next_start_gpu();
 
-// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the launcher, which offers DLSS only
+// A GPU the renderer could run on: its gpu_identity() and its name (UTF-8).
+struct GpuChoice {
+    std::string identity;
+    std::string name;
+};
+// The GPUs the renderer found at its start, in the order its automatic choice takes them (software renderers left
+// out). Each backend records them as it chooses its device.
+void record_gpu_choices(std::vector<GpuChoice> choices) noexcept;
+[[nodiscard]] std::vector<GpuChoice> gpu_choices();
+// The GPU the next start renders on: one of gpu_choices()' identities, or empty for the automatic choice, and the
+// renderer it starts with (the newest that card runs, renderer_choice.h preferred_renderer; kAuto where that is not
+// known). Written to config.ini at once; this session keeps the GPU and the renderer it started with.
+bool choose_next_start_gpu(const std::string& identity, RendererKind renderer = RendererKind::kAuto);
+
+// The renderer config.ini names, which the next start takes (Windows: Nebula.exe hands the start to that renderer's
+// program), as next_start_gpu keeps the gpu key; kAuto: the newest renderer the card runs.
+[[nodiscard]] RendererKind next_start_renderer();
+bool choose_next_start_renderer(RendererKind renderer);
+// The renderer key as config.ini has it now, read before the rest of the settings load (a start's choice of program).
+[[nodiscard]] RendererKind renderer_in_settings_file();
+
+// Records the adapter the renderer runs on (adapter.ini beside config.ini) for the settings, which offer DLSS only
 // on an NVIDIA RTX adapter: description (UTF-8), PCI vendor and device id, its gpu_identity() and whether it runs
 // Nebula's ray tracing.
 void record_render_adapter(const char* description, unsigned vendor_id, unsigned device_id,
@@ -413,8 +445,13 @@ struct RenderAdapter {
     std::string description;
     unsigned vendor_id = 0u;
     unsigned device_id = 0u;
+    std::string driver;  // the driver's version as its maker writes it (record_render_driver); empty when not known
 };
 [[nodiscard]] RenderAdapter render_adapter();
+// The driver's version for render_adapter(), after record_render_adapter (DXGI's user-mode driver version on Windows,
+// VK_KHR_driver_properties' text or the decoded driverVersion with Vulkan; Metal has none: the system's version is the
+// driver's).
+void record_render_driver(std::string version) noexcept;
 // When config.ini changed on disk since this process last read or wrote it (Nebula Settings saved it while the game
 // runs), reads it over the live settings, as the in-game menu would apply them, and returns true.
 bool reload_render_config_if_changed();

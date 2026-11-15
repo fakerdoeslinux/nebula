@@ -7,6 +7,7 @@
 #include "sdl_host.h"
 
 #include "galaxy/content_viewport.h"
+#include "galaxy/input/co_star.h"
 #include "galaxy/input/host_input.h"
 #include "galaxy/input/live_controls_engine.h"
 #include "galaxy/input_bindings.h"
@@ -441,6 +442,14 @@ in::PlayerInput native_game_input(std::uint64_t frame, std::int32_t star_pointer
         live.shake_remote = shaking && tuning.motion_shake == in::MotionShake::Remote;
         live.shake_nunchuk = shaking && tuning.motion_shake == in::MotionShake::Nunchuk;
     }
+
+    // Player 2 (co-star mode): the controller attached last, the one with the highest id (SDL's and the Apple host's
+    // ids grow with every controller attached).
+    std::size_t newest = pad_count;
+    for (std::size_t i = 0; i < pad_count; ++i) {
+        if (newest == pad_count || state.pad_ids[pads[i].device_slot] > state.pad_ids[pads[newest].device_slot]) newest = i;
+    }
+    controls::update_co_star(std::span<controls::LivePad>(pads.data(), pad_count), newest, config);
 
     controls::LiveControlsFrame controls_frame{config};
     controls_frame.pads = std::span<const controls::LivePad>(pads.data(), pad_count);

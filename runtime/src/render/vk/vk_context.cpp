@@ -3,6 +3,7 @@
 #include "galaxy/render/vk/vk_context.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 #include "galaxy/render/rt/rt_shaders.h"
 #include "galaxy/runtime_settings.h"
 
@@ -304,6 +305,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
     failure_.clear();
     if (load_vulkan() != VK_SUCCESS) {
         std::fprintf(stderr, "[vulkan] no Vulkan loader\n");
+        note_no_device();
         failure_ = "no Vulkan driver";
         return false;
     }
@@ -451,7 +453,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         }
     }
 
-    // The GPU chosen in Nebula Settings, else the first discrete device; each needs a graphics queue
+    // The GPU chosen on the System page, else the first discrete device; each needs a graphics queue
     // (that presents to the surface) and the swapchain extension.
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(instance_, &count, nullptr);
@@ -482,6 +484,7 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
 #endif
         std::vector<std::pair<Rank, VkPhysicalDevice>> ranked;
         ranked.reserve(devices.size());
+        std::vector<GpuChoice> choices;  // every GPU but a software renderer, for the System page's GRAPHICS CARD choice
         for (const VkPhysicalDevice device : devices) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(device, &properties);
@@ -495,6 +498,9 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
             }
             const Adapter adapter = adapter_of(device);
             const bool chosen = !chosen_gpu.empty() && adapter.identity == chosen_gpu;
+            if (properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                choices.push_back(GpuChoice{adapter.identity, properties.deviceName});
+            }
             std::uint64_t place = ~std::uint64_t{0};
 #if defined(_WIN32)
             for (std::size_t i = 0; i < windows_order.size() && adapter.luid != 0u; ++i) {
@@ -515,20 +521,24 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         for (std::size_t i = 0; i < ranked.size(); ++i) {
             devices[i] = ranked[i].second;
         }
+        record_gpu_choices(std::move(choices));
     }
-    bool vulkan_1_0_only = false;
+    // What the renderer needs of a device (vulkan_refusal): swapchains; Vulkan 1.1, or 1.0 with what Nebula takes from
+    // 1.1 as the extensions it came from, the physical-device queries (instance) and VK_KHR_maintenance1 (the viewports'
+    // negative height, the transfer bits of format features), the version in use the lower of the instance's and the
+    // device's; and a graphics queue that presents. The renderer check judges every card by the same rule.
+    RendererRefusal refused = RendererRefusal::kNoDevice;
     for (const VkPhysicalDevice candidate : devices) {
-        if (!has_device_extension(candidate, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
-            continue;
-        }
-        // Vulkan 1.1, or 1.0 with what Nebula takes from 1.1 as the extensions it came from: the physical-device queries
-        // (instance) and VK_KHR_maintenance1 (the viewports' negative height, the transfer bits of format features). The
-        // version in use is the lower of the instance's and the device's.
         VkPhysicalDeviceProperties candidate_properties{};
         vkGetPhysicalDeviceProperties(candidate, &candidate_properties);
-        if (std::min(app.apiVersion, candidate_properties.apiVersion) < VK_API_VERSION_1_1 &&
-            !(properties2_extension && has_device_extension(candidate, VK_KHR_MAINTENANCE1_EXTENSION_NAME))) {
-            vulkan_1_0_only = true;
+        VulkanFacts facts;
+        facts.swapchain = has_device_extension(candidate, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        facts.version = std::min(app.apiVersion, candidate_properties.apiVersion);
+        facts.properties2 = properties2_extension;
+        facts.maintenance1 = has_device_extension(candidate, VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+        facts.presenting_queue = true;  // the queue's own search follows
+        if (const RendererRefusal refusal = vulkan_refusal(facts); refusal != RendererRefusal::kNone) {
+            if (refused != RendererRefusal::kVulkanVersion) refused = refusal;
             continue;
         }
         std::uint32_t families = 0;
@@ -553,11 +563,14 @@ bool Context::initialize(const std::string& chosen_gpu, bool validation,
         if (physical_ != VK_NULL_HANDLE) {
             break;
         }
+        if (refused != RendererRefusal::kVulkanVersion) refused = RendererRefusal::kNoPresentQueue;
     }
     if (physical_ == VK_NULL_HANDLE) {
-        return fail(vulkan_1_0_only ? "the GPU's Vulkan driver is version 1.0 without VK_KHR_maintenance1 or "
-                                      "VK_KHR_get_physical_device_properties2"
-                                    : "no device with a graphics queue that presents to the window, and swapchains");
+        note_no_device();
+        return fail(refused == RendererRefusal::kVulkanVersion
+                        ? "the GPU's Vulkan driver is version 1.0 without VK_KHR_maintenance1 or "
+                          "VK_KHR_get_physical_device_properties2"
+                        : "no device with a graphics queue that presents to the window, and swapchains");
     }
     vkGetPhysicalDeviceProperties(physical_, &properties_);
     device_name_ = properties_.deviceName;

@@ -14,7 +14,10 @@
 #      The same personal-detail checks (paths, e-mail, MAC, private terms; not the environment names, which the test tools hold
 #      on purpose) run over every text file git tracks in this repository, except third_party/ and docs/licenses/ (their authors'
 #      details). -SkipSource leaves that out.
-#   3. Every .exe and .dll carries version information (product, file version, description).
+#      An -Installer .exe with a PAYLOAD resource (Nebula Setup's zip of what it installs) has its entries unpacked and
+#      checked as shipped files by 2, 3 and 5.
+#   3. Every .exe and .dll carries version information (product, file version, description), and none is a .NET
+#      assembly (1.0.0 and 1.0.1, built with .NET, were flagged by antivirus programs; 1.0.2's native ones were not).
 #   4. Signatures. Authenticode of every .exe, .dll and .msi: Valid passes; NotSigned is reported as "unsigned" and is
 #      not a failure (it is with -RequireSigned, for the Nebula-owned files); any other state (hash mismatch, untrusted)
 #      is a failure. Each -Installer file's release-key signature (<file>.sig, RSA SHA-256 over the file, checked against
@@ -373,6 +376,79 @@ foreach ($setup in $Installer) {
     $shipped.Add([pscustomobject]@{ Full = $full; Label = "installer " + [IO.Path]::GetFileName($full); Installer = $true })
 }
 
+# Nebula Setup carries what it installs as a zip in its PAYLOAD resource (compressed, so a scan of Setup's own bytes does
+# not read it): the entries are unpacked to a temporary folder and checked as shipped files (2, 3, 3b, 5).
+$payloadReader = @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+public static class NebulaPayload
+{
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+    [DllImport("kernel32", SetLastError = true)] static extern bool FreeLibrary(IntPtr module);
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindResourceW(IntPtr module, string name, IntPtr type);
+    [DllImport("kernel32", SetLastError = true)] static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+    [DllImport("kernel32", SetLastError = true)] static extern IntPtr LockResource(IntPtr data);
+    [DllImport("kernel32", SetLastError = true)] static extern uint SizeofResource(IntPtr module, IntPtr info);
+    // Writes the PAYLOAD resource to `target`; false when the file has none.
+    public static bool Save(string exe, string target)
+    {
+        IntPtr module = LoadLibraryExW(exe, IntPtr.Zero, 0x00000002 | 0x00000020);  // as a data file, as an image resource
+        if (module == IntPtr.Zero) throw new IOException(exe + " could not be opened as a resource file");
+        try
+        {
+            IntPtr info = FindResourceW(module, "PAYLOAD", (IntPtr)10);
+            if (info == IntPtr.Zero) return false;
+            uint size = SizeofResource(module, info);
+            IntPtr data = LockResource(LoadResource(module, info));
+            byte[] bytes = new byte[size];
+            Marshal.Copy(data, bytes, 0, (int)size);
+            File.WriteAllBytes(target, bytes);
+            return true;
+        }
+        finally { FreeLibrary(module); }
+    }
+    // A PE file with a CLR header (data directory 14): a .NET assembly.
+    public static bool IsDotNet(string path)
+    {
+        using (var reader = new BinaryReader(File.OpenRead(path)))
+        {
+            if (reader.BaseStream.Length < 0x40 || reader.ReadUInt16() != 0x5A4D) return false;
+            reader.BaseStream.Position = 0x3C;
+            long pe = reader.ReadUInt32();
+            if (pe + 0x18 + 0x70 + 0x80 > reader.BaseStream.Length) return false;
+            reader.BaseStream.Position = pe;
+            if (reader.ReadUInt32() != 0x00004550) return false;
+            reader.BaseStream.Position = pe + 0x18;
+            ushort magic = reader.ReadUInt16();
+            long directories = pe + 0x18 + (magic == 0x20B ? 0x70 : 0x60);
+            reader.BaseStream.Position = directories + 14 * 8;
+            return reader.ReadUInt32() != 0;
+        }
+    }
+}
+'@
+if (-not ('NebulaPayload' -as [type])) { Add-Type -TypeDefinition $payloadReader }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$payloadFolders = New-Object System.Collections.Generic.List[string]
+foreach ($item in @($shipped | Where-Object { $_.Installer -and $_.Full.ToLowerInvariant().EndsWith(".exe") })) {
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ("nebula-release-check-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force $folder | Out-Null
+    $payloadFolders.Add($folder)
+    $zip = Join-Path $folder "payload.zip"
+    if (-not [NebulaPayload]::Save($item.Full, $zip)) { $notes.Add("$($item.Label) has no PAYLOAD resource"); continue }
+    $unpacked = Join-Path $folder "payload"
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+    $count = 0
+    foreach ($entry in Get-ChildItem -LiteralPath $unpacked -Recurse -File) {
+        $shipped.Add([pscustomobject]@{ Full = $entry.FullName; Label = "$($item.Label) > " + $entry.FullName.Substring($unpacked.Length + 1).Replace('\', '/'); Installer = $false })
+        $count++
+    }
+    $notes.Add("$($item.Label): the $count files of its payload were checked as shipped files")
+}
+
 foreach ($item in $shipped) {
     $extension = [IO.Path]::GetExtension($item.Full).ToLowerInvariant()
     if ($extension -in @(".exe", ".dll")) {
@@ -381,6 +457,8 @@ foreach ($item in $shipped) {
             [string]::IsNullOrWhiteSpace($info.FileDescription)) {
             $failures.Add("$($item.Label): no version information (product, file version and description)")
         }
+        # 3b. Native programs only: the .NET builds of 1.0.0 and 1.0.1 were flagged, 1.0.2's native ones were not.
+        if ([NebulaPayload]::IsDotNet($item.Full)) { $failures.Add("$($item.Label) is a .NET assembly: Nebula ships native programs only") }
     }
     foreach ($finding in [NebulaReleaseScan]::ScanFile($item.Full, $item.Label, $options)) { $failures.Add($finding) }
 }
@@ -440,6 +518,7 @@ if ($SkipDefender) {
     }
 }
 
+foreach ($folder in $payloadFolders) { Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue }
 foreach ($note in $notes) { Write-Output "release_check: note: $note" }
 if ($failures.Count -ne 0) {
     Write-Output "release_check: $($failures.Count) failure(s) in $Path"

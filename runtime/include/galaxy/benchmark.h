@@ -9,14 +9,11 @@
 // as they were.
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
-
-namespace galaxy::render {
-struct RenderConfig;
-}
 
 namespace galaxy::bench {
 
@@ -43,11 +40,75 @@ inline void note_audio_thread() noexcept {
     }
 }
 
+// The player stops the run (Escape, a controller's B, Android's back; native_settings.cpp): any thread. The game ends
+// at its next picture; the result is written as stopped (status "aborted", failure "stopped") with the steps that
+// finished, and the game starts again with it (returns_home).
+inline std::atomic<bool> g_stop_asked{false};
+inline void stop() noexcept {
+    if (running()) g_stop_asked.store(true, std::memory_order_relaxed);
+}
+[[nodiscard]] inline bool stopping() noexcept {
+    return g_stop_asked.load(std::memory_order_relaxed);
+}
+
+// True while a measured window runs: the game's frame clock (svc_frame_wait) and the renderers' present pacer
+// (PresentPacer::pace) wait for nothing, so each frame comes as soon as the device has made the one before it (the
+// render queue's depth holds the game back). The game's frames are the same on every device; only their speed differs.
+inline std::atomic<bool> g_unpaced{false};
+[[nodiscard]] inline bool unpaced() noexcept {
+    return g_unpaced.load(std::memory_order_relaxed);
+}
+
+// The renderers, as one frame's pass timestamps are read back (render thread): each pass's milliseconds in that frame,
+// `names[i]` static text. Set only while a window measures.
+inline std::atomic<void (*)(const char* const* names, const double* ms, std::size_t count)> g_gpu_frame_hook{nullptr};
+inline void note_gpu_frame(const char* const* names, const double* ms, std::size_t count) noexcept {
+    if (void (*hook)(const char* const*, const double*, std::size_t) = g_gpu_frame_hook.load(std::memory_order_acquire)) {
+        hook(names, ms, count);
+    }
+}
+
+// The game's disc reads (svc_asset_read), counted while a benchmark runs: a slow frame that read is a loading hitch.
+inline std::atomic<std::uint64_t> g_read_bytes{0u};
+inline void note_read(std::uint64_t bytes) noexcept {
+    if (running()) g_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+// The work the game hands the renderer while a benchmark runs: each frame list's draw items (RenderCore::render_frame)
+// and the texture images made or rewritten (TextureStore), with their bytes.
+inline std::atomic<std::uint64_t> g_draw_items{0u};
+inline std::atomic<std::uint64_t> g_texture_uploads{0u};
+inline std::atomic<std::uint64_t> g_texture_bytes{0u};
+inline void note_frame_list(std::uint32_t items) noexcept {
+    if (running()) g_draw_items.fetch_add(items, std::memory_order_relaxed);
+}
+inline void note_texture(std::uint64_t bytes) noexcept {
+    if (running()) {
+        g_texture_uploads.fetch_add(1u, std::memory_order_relaxed);
+        g_texture_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
 struct Options {
     std::filesystem::path pak_folder;  // benchmark.tsv beside game.pak replaces the built-in stage list
-    std::filesystem::path out_file;    // --benchmark-out; empty: diagnostics/benchmark-<utc>.json in the data folder
-    bool return_home = false;          // --benchmark-return 1: started from the home screen, which it starts again after
+    std::filesystem::path out_file;    // --benchmark-out; empty: a new file in results_folder() (benchmark_results.h)
+    bool return_home = false;          // --benchmark-return 1: the game starts again after it, with its result open
 };
+
+// The run as the game's run panel shows it (live_state).
+enum class Part : unsigned { Yours, Standard, Probe, Again };
+struct LiveState {
+    std::uint32_t step = 0u, steps = 0u;  // the step running, from 1, of the run's steps
+    Part part = Part::Yours;              // what the step measures: your settings, the standard settings, one
+                                          // optional pass, or the first stage again (the device warmed up)
+    bool measuring = false;               // the step's frames are being measured (not loading or settling)
+    std::uint32_t fps_tenths = 0u;        // pictures shown a second over the last half second, in tenths; 0 not known
+    std::uint32_t progress = 0u;          // the whole run, 0 to 10000, never going back
+    bool stopping = false;                // the player stopped it: the game is about to start again
+    std::string stage;                    // the step's stage (the game's name: CosmosGardenGalaxy)
+};
+// Game thread: the run now; false when no benchmark runs or it has ended.
+[[nodiscard]] bool live_state(LiveState& out);
 
 // Main thread, before the game module attaches.
 void start(const Options& options);
@@ -69,11 +130,7 @@ void at_exit() noexcept;
 
 // The file this run writes, fixed by start(); empty when there is no data folder and no --benchmark-out.
 [[nodiscard]] std::filesystem::path result_file();
-// Started from the home screen and ended (complete or failed): the host starts the home screen again.
+// Started to return (Options::return_home) and ended (complete, failed or stopped): the host starts the game again.
 [[nodiscard]] bool returns_home() noexcept;
-
-// A finished run's result with a recommendation (status complete): its recommended settings put over `config`; false,
-// `config` as it was, for any other file. Reads only what write_result writes.
-[[nodiscard]] bool read_recommendation(const std::filesystem::path& file, render::RenderConfig& config);
 
 }  // namespace galaxy::bench
