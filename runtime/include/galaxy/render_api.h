@@ -192,6 +192,11 @@ bool native_settings_pad_key(std::uintptr_t virtual_key);
 // A text option is being typed in: the host shows its on-screen keyboard (SDL_StartTextInput).
 [[nodiscard]] bool native_settings_text_wanted() noexcept;
 void native_settings_files_dropped(std::vector<std::filesystem::path> files);
+// The files this start was given to import (--import: Open with, a file's association), once: the window hands them to
+// native_settings_files_dropped. From then on a restart of this start leaves them out (--imports-taken), so an import
+// that restarts the game is not made again.
+[[nodiscard]] std::vector<std::filesystem::path> native_settings_take_launch_imports();
+[[nodiscard]] bool native_settings_launch_imports_taken() noexcept;
 void native_settings_window_resized(unsigned width, unsigned height);
 // The graphics device lost at the renderer's next frame, as a driver reset loses it (an extension's lose_gpu_device).
 void lose_gpu_device() noexcept;
@@ -258,6 +263,12 @@ enum class NativeSettingsStatus : unsigned {
                       // (next: Apply, before: Revert, back: Close)
     ModRemoveAsk,     // remove the mod whose page is open? status_number 1: to the recycle bin (yes: Apply, no: Close)
     ModForgetAsk,     // forget what a removed mod kept? (status_text: its id; yes: Apply, no: Close)
+    BenchmarkAsk,     // restart and run the benchmark? (yes: Apply, no: Close)
+    BenchmarkResults, // the benchmark's results, a page at a time: status_text the title, long_text the table
+                      // (settings_benchmark_page.h), status_number page << 8 | pages, the summary's picture its graph
+                      // (next: Apply, before: Revert, back: Close)
+    BenchmarkSendAsk, // send the last result? status_number 1: Revert shows the report (yes: Apply, no: Close)
+    RendererRestart,  // the new renderer applies at the next start
 };
 // A picture the menu shows (a mod's icon or one of its pictures): RGBA8 rows, tightly packed, straight alpha.
 struct NativeSettingsPicture {
@@ -273,6 +284,14 @@ inline constexpr int kJoyConRightHeldBit = 8;  // its R is held
 inline constexpr int kJoyConPairedBit = 16;    // a pair was just made
 inline constexpr int kJoyConLeftPressesShift = 8;    // 4 bits: the left halves' button presses, counted round
 inline constexpr int kJoyConRightPressesShift = 12;  // 4 bits: the right halves'
+// The benchmark's frame-time graph in a NativeSettingsView's picture (nebula_game_api.h graph_*): the plot in texels,
+// the scale in milliseconds, the column where each stage starts. All 0 when the picture is no graph.
+struct NativeSettingsGraph {
+    unsigned left = 0u, top = 0u, right = 0u, bottom = 0u;
+    float top_fps = 0.0f, step_fps = 0.0f;
+    std::vector<unsigned> stage_starts;
+    bool operator==(const NativeSettingsGraph&) const = default;
+};
 struct NativeSettingsView {
     bool open = false;
     unsigned page = 0u;
@@ -289,9 +308,12 @@ struct NativeSettingsView {
     std::string status_text;
     std::string long_text;
     std::shared_ptr<const NativeSettingsPicture> picture;
+    NativeSettingsGraph graph;  // the picture's plot when it is the benchmark's frame-time graph
 };
 // The menu as it stands. The first call hands the drawing to the game: the overlay draws nothing of its own after.
 [[nodiscard]] NativeSettingsView native_settings_view();
+// What the hints name now (NativeSettingsView::input): the button style chosen, else what the player last used.
+[[nodiscard]] unsigned native_settings_hint_input();
 // The pointer's input to the menu (the game's own menu takes the pointer; the window thread the keyboard and pads).
 // CloseUnseen is the host's own: the game's close where it shows no menu (before its first 3D scene, the boot). It
 // closes a menu that asks nothing; one that asks is hidden as it stands, nothing answered, until

@@ -5,7 +5,8 @@
 class ValueControl;
 
 // Back to the title, a restart or leaving the game: the picture fades out and the sound stops, then the game goes on from
-// the title (fading in) or the host restarts or closes it.
+// the title (fading in) or the host restarts or closes it. The host's reset (NEBULA_HOME_MENU_RESET) goes back to the
+// title with the saves read again.
 class GameSystemRestartProcess : public LayoutActor {
 public:
     enum ResetOperation {
@@ -38,4 +39,5 @@ private:
 
     ValueControl* mFadeinoutControl;
     s32 mResetOperation;
+    bool mReloadSaves;  // the host's reset: the saves are read again before the title
 };

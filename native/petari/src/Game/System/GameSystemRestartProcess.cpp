@@ -4,10 +4,12 @@
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/System/GameSequenceFunction.hpp"
 #include "Game/System/GameSystemFunction.hpp"
+#include "Game/Screen/NebulaLauncher.hpp"
 #include "Game/Util/Color.hpp"
 #include "Game/Util/DrawUtil.hpp"
 #include "Game/Util/LayoutUtil.hpp"
 #include "Game/Util/MathUtil.hpp"
+#include "Game/Util/SceneUtil.hpp"
 #include "Game/Util/ScreenUtil.hpp"
 #include "Game/Util/SingletonHolder.hpp"
 #include "Game/Util/ValueControl.hpp"
@@ -80,8 +82,14 @@ void GameSystemRestartProcess::beginFadeOut(bool isImmediate) {
     setNerve(GET_NERVE(GameSystemRestartProcess, GameSystemRestartProcessFadeOut));
 }
 
-// Resets come from the system menu (requestReset, requestQuitGame) and the file select's quit.
+// Resets come from the system menu (requestReset, requestQuitGame), the file select's quit and the host (the benchmark
+// in the running game, at its start and its end), past the boot.
 void GameSystemRestartProcess::exeIdle() {
+    if (!MR::isCurrentScene(SceneKind_Boot) && NebulaLauncher::takeReset()) {
+        mResetOperation = ResetOperation_ApplicationReset;
+        mReloadSaves = true;
+        beginFadeOut(false);
+    }
 }
 
 // The scene, the sound (stopped, then faded to silence) and the save sequence wind down while the picture fades.
@@ -103,8 +111,10 @@ void GameSystemRestartProcess::exeFadeOut() {
 void GameSystemRestartProcess::reset() {
     GameSystemFunction::setPermissionToCheckInput(false);
 
-    // New mods need a new run: the same fade and sound, then the game starts again with them.
-    if (mResetOperation != ResetOperation_ApplicationReset || NebulaHost::option(NEBULA_OPTION_MODS_CHANGED) != 0) {
+    // New mods need a new run: the same fade and sound, then the game starts again with them. The host's reset keeps the
+    // game it measures.
+    if (mResetOperation != ResetOperation_ApplicationReset ||
+        (!mReloadSaves && NebulaHost::option(NEBULA_OPTION_MODS_CHANGED) != 0)) {
         exitApplication();
     }
 
@@ -126,10 +136,19 @@ void GameSystemRestartProcess::exeWaitPrepareFadein() {
 void GameSystemRestartProcess::exeFadein() {
     if (MR::isFirstStep(this)) {
         GameSystemFunction::restoreFromResetSaveDataHandleSequence();
+        if (mReloadSaves) {
+            GameSequenceFunction::startReloadSaveDataSequence();
+        }
+        mFadeinoutControl->setDirToOneResetFrame();
     }
 
-    if (MR::isFirstStep(this)) {
-        mFadeinoutControl->setDirToOneResetFrame();
+    // The host's reset: the title waits for the saves (the save sequence runs while the reset does).
+    if (mReloadSaves) {
+        if (GameSequenceFunction::isActiveSaveDataHandleSequence()) {
+            return;
+        }
+        mReloadSaves = false;
+        NebulaLauncher::resetDone();
     }
 
     if (mFadeinoutControl->mFrame == mFadeinoutControl->mMaxFrame) {
@@ -158,7 +177,7 @@ void GameSystemRestartProcess::control() {
 }
 
 GameSystemRestartProcess::GameSystemRestartProcess()
-    : LayoutActor("リセット・電源", false), mFadeinoutControl(), mResetOperation(ResetOperation_Restart) {
+    : LayoutActor("リセット・電源", false), mFadeinoutControl(), mResetOperation(ResetOperation_Restart), mReloadSaves(false) {
     lumacore::setClass(this, lumacore::kClassId< GameSystemRestartProcess >);
     mFadeinoutControl = new ValueControl(::sFadeinoutFrame);
     mFadeinoutControl->setOne();

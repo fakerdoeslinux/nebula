@@ -210,7 +210,10 @@ void TextureBackend::release_view(std::uint32_t index) {
 
 TextureBackend::UploadChunk TextureBackend::create_upload_chunk(std::uint64_t size) {
     UploadChunk chunk{};
-    chunk.resource = vk::Context::get().create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "texture upload arena");
+    // Host image copies read the staged texels on the CPU (vkCopyMemoryToImageEXT): from cached memory, as
+    // write-combined memory is read uncached. The copy queue's copies read either at the bus's speed.
+    chunk.resource = vk::Context::get().create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "texture upload arena",
+                                                      host_formats_ != 0u ? vk::BufferPlace::HostRead : vk::BufferPlace::Host);
     if (!chunk.resource) {
         throw std::runtime_error("[TextureStore] create texture upload arena failed");
     }

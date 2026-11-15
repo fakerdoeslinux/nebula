@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -122,11 +123,19 @@ void UploadRing::begin_frame(unsigned frame_slot) {
     if (mapped_ == nullptr || frame_slot >= frames_in_flight_) {
         throw std::runtime_error("UploadRing frame slot is out of range");
     }
-    // The frame before: what it took (segment, spill and chunks) joins the quiet window. A window of kQuietFrames frames whose
-    // peak stayed within a quarter of the budget lets the ring shrink (wants_shrink); a busier one does not.
+    // The frame before: what it took (segment, spill and chunks) joins the quiet window. A window of kQuietFrames frames and
+    // kQuietNs whose peak stayed within a quarter of the budget lets the ring shrink (wants_shrink); a busier one does not.
     if (frame_ready_) {
         window_peak_ = std::max(window_peak_, cursor_ - segment_base_ + frame_spill_);
-        if (++window_frames_ >= kQuietFrames) {
+        const auto now_ns = [] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch())
+                                                  .count());
+        };
+        if (window_frames_ == 0u) {
+            window_start_ns_ = now_ns();
+        }
+        if (++window_frames_ >= kQuietFrames && now_ns() - window_start_ns_ >= kQuietNs) {
             shrink_ready_ = capacity_ > floor_capacity_ && window_peak_ <= bytes_per_frame_ / 4u;
             shrink_peak_ = window_peak_;
             window_peak_ = 0u;

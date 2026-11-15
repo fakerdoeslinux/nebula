@@ -106,11 +106,14 @@ public:
         }
         return capacity;
     }
-    // After kQuietFrames frames in a row in which no frame used more than a quarter of the budget (and none was asked to), the
-    // ring can give memory back: shrunk_capacity() is the smallest capacity, a halving of this one at a time and never under the
-    // capacity the ring first had, whose budget is still twice the quiet window's peak. The caller makes the ring again at that
-    // size at a frame boundary, as for growth. The window starts over with every initialize.
+    // After a quiet window, kQuietFrames frames in a row and kQuietNs of time, in which no frame used more than a quarter of the
+    // budget (and none was asked to), the ring can give memory back: shrunk_capacity() is the smallest capacity, a halving of
+    // this one at a time and never under the capacity the ring first had, whose budget is still twice the quiet window's peak.
+    // The caller makes the ring again at that size at a frame boundary, as for growth. The window starts over with every
+    // initialize. Frames alone are no measure: a loading screen draws thousands a second, so a stage change would shrink the
+    // rings and the next stage's first frames make them again.
     static constexpr unsigned kQuietFrames = 600u;
+    static constexpr std::uint64_t kQuietNs = 30'000'000'000ull;
     [[nodiscard]] bool wants_shrink() const { return mapped_ != nullptr && shrink_ready_ && !wants_growth(); }
     [[nodiscard]] std::size_t shrunk_capacity(unsigned segments) const {
         std::size_t capacity = capacity_;
@@ -175,11 +178,13 @@ private:
     std::size_t frame_spill_ = 0;
     std::size_t high_water_ = 0;
     std::size_t requested_ = 0;
-    // The quiet window (kQuietFrames frames): its peak use or request, how many frames it has, whether the last full one was quiet
-    // enough to shrink after (and its peak then), and the capacity the ring first had (kept across reset).
+    // The quiet window (kQuietFrames frames and kQuietNs): its peak use or request, how many frames it has and when its first
+    // began (steady clock), whether the last full one was quiet enough to shrink after (and its peak then), and the capacity
+    // the ring first had (kept across reset).
     std::size_t window_peak_ = 0;
     std::size_t shrink_peak_ = 0;
     unsigned window_frames_ = 0;
+    std::uint64_t window_start_ns_ = 0;
     bool shrink_ready_ = false;
     std::size_t floor_capacity_ = 0;
     unsigned frames_in_flight_ = 0;

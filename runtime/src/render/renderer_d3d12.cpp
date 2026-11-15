@@ -1,5 +1,6 @@
 // RendererD3D12: device and swap chain, scene targets and copies, presentation.
 #include "galaxy/render/utility_shaders.h"
+#include "galaxy/benchmark.h"
 #include "galaxy/launch_args.h"
 #include "galaxy/render/renderer_d3d12.h"
 #include "galaxy/render/program_table.h"
@@ -15,6 +16,7 @@
 #include "galaxy/render/game_bloom_shape.h"
 #include "barriers_d3d12.h"
 #include "galaxy/render/render_config.h"
+#include "galaxy/render/renderer_choice.h"
 #include "galaxy/render/rt/rt_backend.h"
 #include "galaxy/render/rt/rt_shaders.h"
 #include "galaxy/render/rt_caps.h"
@@ -1831,20 +1833,20 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             if (FAILED(made)) {
                 return false;
             }
-            // What no draw runs without: every texture and sampler in one unbounded table each, indexed by heap slot
-            // (create_draw_root_signature; tier 1 gives a stage 128 views and 16 samplers), and the programs' DXIL
-            // (shader model 6.0). An adapter without them is passed over, so the next one can be taken.
+            // What no draw runs without (d3d12_refusal: resource binding tier 2, shader model 6.0); the renderer check
+            // judges every card by the same rule. An adapter without it is passed over, so the next one can be taken.
+            D3D12Facts facts;
+            facts.device = true;
             D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            if (SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)))) {
+                facts.binding_tier = static_cast<unsigned>(options.ResourceBindingTier);
+            }
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
-            const bool bindless =
-                SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
-                options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
-            const bool dxil =
-                SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) &&
-                model.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
-            if (!bindless || !dxil) {
-                refused = narrow_utf8(description.Description) +
-                          (!bindless ? ": resource binding tier 1, tier 2 needed" : ": no shader model 6.0");
+            if (SUCCEEDED(candidate_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)))) {
+                facts.shader_model = static_cast<unsigned>(model.HighestShaderModel);
+            }
+            if (const RendererRefusal refusal = d3d12_refusal(facts); refusal != RendererRefusal::kNone) {
+                refused = narrow_utf8(description.Description) + ": " + refusal_reason(refusal);
                 std::cout << "[gpu] passed over " << refused << '\n';
                 return false;
             }
@@ -1875,7 +1877,10 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
         };
         bool expect_rtx = false;
         {
+            // Every hardware adapter, in Windows' order, for the System page's GRAPHICS CARD choice.
+            std::vector<GpuChoice> choices;
             bool first = true;
+            bool settled = false;
             for (UINT index = 0u;; ++index) {
                 ComPtr<IDXGIAdapter1> candidate;
                 DXGI_ADAPTER_DESC1 description{};
@@ -1885,16 +1890,18 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
                 if (FAILED(candidate->GetDesc1(&description)) || (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) {
                     continue;
                 }
-                const bool chosen = !chosen_gpu.empty() &&
-                                    gpu_identity(description.VendorId, description.DeviceId, description.SubSysId) == chosen_gpu;
-                if (chosen || first) {
+                const std::string identity = gpu_identity(description.VendorId, description.DeviceId, description.SubSysId);
+                std::array<char, 128> name{};
+                copy_adapter_description(description, name);
+                choices.push_back(GpuChoice{identity, name.data()});
+                const bool chosen = !chosen_gpu.empty() && identity == chosen_gpu;
+                if (!settled && (chosen || first)) {
                     expect_rtx = rtx(description);
                 }
                 first = false;
-                if (chosen) {
-                    break;
-                }
+                settled = settled || chosen;
             }
+            record_gpu_choices(std::move(choices));
         }
         const bool frame_generation = get_render_config().frame_generation != 0u;
         std::thread streamline_start;
@@ -1955,6 +1962,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             streamline_start.join();
         }
         if (!adapter || !device_) {
+            if (!same_card_only_) note_no_device();
             throw std::runtime_error(refused.empty() ? std::string("No hardware D3D12 adapter supports feature level 11_0")
                                                      : "No hardware D3D12 adapter can run the renderer (" + refused + ")");
         }
@@ -2114,6 +2122,7 @@ bool RendererD3D12::initialize(int window_width, int window_height, const FrameM
             copy_adapter_description(adapter_desc, description);
             record_render_adapter(description.data(), adapter_desc.VendorId, adapter_desc.DeviceId,
                                   adapter_desc.SubSysId, offered);
+            record_render_driver(dxgi_driver_version(adapter.Get()));
         }
         RenderFeatureCaps caps{};
         caps.d3d12_device_created = true;
@@ -3390,8 +3399,8 @@ void RendererD3D12::begin_frame() {
             // The settings changed: decided again.
             temporal_interp_suspended_ = false;
         }
-        // A ring whose frames took over half their budget (or spilled) grows before the next frame; one whose last 600 frames
-        // stayed under a quarter of it gives half of its memory back. --diagnostics ring-stress makes them again (at the
+        // A ring whose frames took over half their budget (or spilled) grows before the next frame; one whose last 30 seconds
+        // (and 600 frames) stayed under a quarter of it gives half of its memory back (UploadRing::kQuietNs). --diagnostics ring-stress makes them again (at the
         // size each wants) every kRingStressFrames frames.
         const bool ring_stress =
             ::galaxy::diagnosing(::galaxy::kDiagnoseRingStress) && frame_index_ % ::galaxy::kRingStressFrames == 0u;
@@ -3401,6 +3410,7 @@ void RendererD3D12::begin_frame() {
             // No wait for the GPU: a ring is made again as a new buffer (the same size when only its segments change), and the old
             // one and its chunks go to the newest frame in flight's retired list, released after that frame's fence, which is
             // past every earlier frame's.
+            const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::RingResize);
             std::vector<gpu::BufferRef>& old = retired_targets_[(frame_index_ + kFramesInFlight - 1u) % kFramesInFlight];
             const auto place = [&](UploadRing& ring, const char* name, unsigned count, bool chunks) {
                 const std::size_t had = ring.capacity();
@@ -3540,6 +3550,7 @@ void RendererD3D12::begin_frame() {
                     pass_ema_ms_[pass].store(before == 0.0f ? value : before + (value - before) * 0.1f, std::memory_order_relaxed);
                 }
             }
+            galaxy::bench::note_gpu_frame(kPassTimeNames, frame_ms.data(), std::min(std::size(kPassTimeNames), frame_ms.size()));
             const D3D12_RANGE no_write{0, 0};
             pass_readback_->Unmap(0, &no_write);
         }
@@ -3985,14 +3996,17 @@ void RendererD3D12::present_to_swap_chain() {
     // The display's own signal that a frame may be queued, awaited asleep (never a poll) and bounded, so a display that stopped
     // never holds the render thread. Not when presenting at once with no wait for the display (vsync off), and not on a chain
     // that frame generation replaced.
-    if (latency_wait_ != nullptr && vsync != 0u && !generating && !fsr_swap_chain_ &&
-        WaitForSingleObjectEx(latency_wait_, 100u, TRUE) == WAIT_TIMEOUT && ++latency_timeouts_ <= 4u) {
-        std::cerr << "[present] the frame latency object did not signal within 100 ms\n";
+    if (latency_wait_ != nullptr && vsync != 0u && !generating && !fsr_swap_chain_) {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Acquire);
+        if (WaitForSingleObjectEx(latency_wait_, 100u, TRUE) == WAIT_TIMEOUT && ++latency_timeouts_ <= 4u) {
+            std::cerr << "[present] the frame latency object did not signal within 100 ms\n";
+        }
     }
     // No pipeline creation spans the Present (core/present_gate.h).
     HRESULT present_hr = S_OK;
     {
         const core::PresentScope gate;
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Present);
         present_hr = swap_chain_->Present(vsync, present_flags);
     }
     if (generating && collect_present_telemetry) {
@@ -4230,7 +4244,7 @@ void RendererD3D12::present_to_swap_chain() {
     if (!window_shown_ && window_ != nullptr &&
         !host_window::hidden_window_mode_enabled()) {
         window_shown_ = true;
-        ShowWindowAsync(window_, SW_SHOWNORMAL);
+        host_window::show_window(window_);
     }
 }
 
@@ -4291,7 +4305,10 @@ std::uint64_t RendererD3D12::end_frame(
         streamline::marker(streamline::Marker::kSimulationEnd);
         streamline::marker(streamline::Marker::kRenderSubmitStart);
     }
-    queue_->ExecuteCommandLists(static_cast<UINT>(submit_lists_.size()), submit_lists_.data());
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::Submit);
+        queue_->ExecuteCommandLists(static_cast<UINT>(submit_lists_.size()), submit_lists_.data());
+    }
     if (present_swap_chain) {
         streamline::marker(streamline::Marker::kRenderSubmitEnd);
     }
@@ -4356,6 +4373,7 @@ std::uint64_t RendererD3D12::completed_fence_value() const {
 }
 
 void RendererD3D12::wait_for_fence_value(std::uint64_t fence_value) {
+    const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::FrameWait);
     if (device_gone_) {
         return;
     }

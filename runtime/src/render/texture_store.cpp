@@ -3,6 +3,7 @@
 #include "galaxy/windows_api.h"
 
 #include "galaxy/render/texture_store.h"
+#include "galaxy/benchmark.h"
 
 #include "galaxy/loss_report.h"
 #include "galaxy/render/block4_astc.h"
@@ -386,6 +387,7 @@ bool TextureStore::stage_image(Op& op, const void* bytes, std::uint32_t size, st
 }
 
 std::uint32_t TextureStore::register_image(const NebulaTextureImage& image) {
+    galaxy::bench::note_texture(image.size);
     return gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Create;
@@ -408,6 +410,7 @@ void TextureStore::update_image(std::uint32_t id, const void* bytes, std::uint32
     if (id == 0u || is_target(id)) {
         return;
     }
+    galaxy::bench::note_texture(size);
     gate_->use([&] {
         Op op;
         op.kind = Op::Kind::Update;
@@ -527,17 +530,23 @@ void TextureStore::begin_frame(unsigned frame_slot, unsigned frames_in_flight) {
         movie_staging_.resize(frames_in_flight);
     }
     ++frame_;
-    // The copy queue is done with what this slot's last frame sent it before its staging and retired textures go free.
-    backend_.begin_frame(frame_slot);
-    // The renderer has waited for this slot's fence: what it retired and read is idle.
-    for (Retired& retired : retired_[frame_slot]) {
-        evicting_bytes_ -= std::min(evicting_bytes_, retired.evicted_bytes);
-        if (retired.view != ~0u) {
-            backend_.release_view(retired.view);
-            free_srv_indices_.push_back(retired.view);
-        }
+    {
+        // The copy queue is done with what this slot's last frame sent it before its staging and retired textures go free.
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::UploadWait);
+        backend_.begin_frame(frame_slot);
     }
-    retired_[frame_slot].clear();
+    {
+        // The renderer has waited for this slot's fence: what it retired and read is idle.
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureFree);
+        for (Retired& retired : retired_[frame_slot]) {
+            evicting_bytes_ -= std::min(evicting_bytes_, retired.evicted_bytes);
+            if (retired.view != ~0u) {
+                backend_.release_view(retired.view);
+                free_srv_indices_.push_back(retired.view);
+            }
+        }
+        retired_[frame_slot].clear();
+    }
     frame_slot_ = frame_slot;
     for (ChunkRef& chunk : kept_[frame_slot]) {
         if (chunk.use_count() == 1 && chunk->size == kStagingChunkBytes) {
@@ -625,9 +634,13 @@ void TextureStore::apply_built_in(Op& op) {
     if (op.staged.chunk != nullptr) {
         try {
             std::uint64_t bytes = 0u;
-            gpu::TextureRef texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, bytes,
-                                                              TexelFormat::Rgba8, true);
+            gpu::TextureRef texture;
+            {
+                const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureCreate);
+                texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, bytes, TexelFormat::Rgba8, true);
+            }
             if (texture) {
+                const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
                 backend_.record_upload(gpu::raw(texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
                                        op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
                 keep(op.staged.chunk);
@@ -649,7 +662,10 @@ void TextureStore::apply_built_in(Op& op) {
 
 void TextureStore::make_own(Entry& entry, const Op& op, bool once) {
     std::uint64_t allocation = 0u;
-    entry.texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, allocation, op.staged.format, once);
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureCreate);
+        entry.texture = backend_.create_texture(op.staged.width, op.staged.height, op.staged.levels, allocation, op.staged.format, once);
+    }
     entry.bytes = allocation;
     // A whole texture is what the budget measures a reduced one against.
     entry.dropped = op.drop;
@@ -659,8 +675,11 @@ void TextureStore::make_own(Entry& entry, const Op& op, bool once) {
         // The record's levels, generated ones too: the budget leaves top levels out of those.
         entry.full_levels = std::max(op.full_levels, op.staged.levels);
     }
-    backend_.record_upload(gpu::raw(entry.texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
-                           op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+    {
+        const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
+        backend_.record_upload(gpu::raw(entry.texture), false, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
+                               op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+    }
     keep(op.staged.chunk);
     TextureHandle& own = entry.own;
     own.resource = gpu::raw(entry.texture);
@@ -705,8 +724,11 @@ void TextureStore::update_entry(Op& op) {
                       own.mip_levels == op.staged.levels && entry.name.format == op.name.format &&
                       !TextureBackend::direct_written(gpu::raw(entry.texture));
     if (same) {
-        backend_.record_upload(gpu::raw(entry.texture), true, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
-                               op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+        {
+            const galaxy::bench::RenderSpan span(galaxy::bench::RenderPart::TextureUpload);
+            backend_.record_upload(gpu::raw(entry.texture), true, *op.staged.chunk, op.staged.offset, op.staged.width, op.staged.height,
+                                   op.staged.levels, op.staged.offsets.data(), op.staged.pitches.data());
+        }
         keep(op.staged.chunk);
         if (entry.name.hash == op.name.hash) {
             return;
