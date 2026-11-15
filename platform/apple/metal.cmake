@@ -13,6 +13,7 @@ if(nebula_apple_builds_tools)
         "${nebula_apple_utility_spirv_dir}/utility_spirv_data.h")
     target_include_directories(nebula_apple_utility_msl PRIVATE "${nebula_apple_utility_spirv_dir}")
     target_link_libraries(nebula_apple_utility_msl PRIVATE nebula_msl)
+    add_dependencies(nebula_apple_utility_msl galaxy_utility_spirv_header)  # made in platform/sdl
     set_target_properties(nebula_apple_utility_msl PROPERTIES
         OUTPUT_NAME utility_msl RUNTIME_OUTPUT_DIRECTORY "${NEBULA_HOST_TOOLS}")
     set(nebula_apple_utility_msl_tool "$<TARGET_FILE:nebula_apple_utility_msl>")

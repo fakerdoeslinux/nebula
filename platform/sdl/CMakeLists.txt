@@ -78,6 +78,9 @@ file(MAKE_DIRECTORY "${galaxy_utility_spirv_dir}")
 add_custom_command(OUTPUT "${galaxy_utility_spirv_dir}/utility_spirv_data.h"
     COMMAND galaxy_utility_spirv "${galaxy_utility_spirv_dir}/utility_spirv_data.h"
     DEPENDS galaxy_utility_spirv VERBATIM)
+# The header as a target of its own: the Apple build's MSL tool (platform/apple/metal.cmake), in another folder, waits
+# for it.
+add_custom_target(galaxy_utility_spirv_header DEPENDS "${galaxy_utility_spirv_dir}/utility_spirv_data.h")
 
 set(rt "${nebula_root}/runtime/src")
 add_library(galaxy_render_vk STATIC
